@@ -252,26 +252,33 @@ hy-common-log/
 
 #### 4.1.1 核心原理
 
-通过自定义实现 `ch.qos.logback.core.Appender` 接口，将其配置到 logback.xml 中，从而接管所有日志事件。
+通过 Spring Boot 自动配置类 `LogAutoConfiguration` 编程式注册自定义 Appender，无需手动配置 logback.xml。
+
+#### 4.1.2 HyCommonLogAppender 实现
 
 ```java
 package com.houyu.common.log.appender;
 
-import ch.qos.logback.core.Appender;
-import ch.qos.logback.core.spi.AppenderAttachable;
 import ch.qos.logback.classic.spi.ILoggingEvent;
+import ch.qos.logback.core.AppenderBase;
 import com.lmax.disruptor.RingBuffer;
 import com.lmax.disruptor.dsl.Disruptor;
+import com.lmax.disruptor.dsl.ProducerType;
+import com.lmax.disruptor.BlockingWaitStrategy;
 
 public class HyCommonLogAppender extends AppenderBase<ILoggingEvent> {
     
     private Disruptor<LogEventEvent> disruptor;
     private RingBuffer<LogEventEvent> ringBuffer;
+    private final int bufferSize;
+    
+    public HyCommonLogAppender(int bufferSize) {
+        this.bufferSize = bufferSize;
+    }
     
     @Override
     public void start() {
         // 初始化 Disruptor 异步队列
-        int bufferSize = 1024 * 8;
         ThreadFactory threadFactory = new ThreadFactoryBuilder()
                 .setNameFormat("log-disruptor-%d")
                 .build();
@@ -318,21 +325,99 @@ public class HyCommonLogAppender extends AppenderBase<ILoggingEvent> {
 }
 ```
 
-#### 4.1.2 Logback 配置示例
+#### 4.1.3 LogEventEvent 事件封装
 
-```xml
-<?xml version="1.0" encoding="UTF-8"?>
-<configuration>
-    <!-- 定义自定义 Appender -->
-    <appender name="HY_COMMON_LOG" class="com.houyu.common.log.appender.HyCommonLogAppender">
-        <!-- 配置参数 -->
-    </appender>
+```java
+package com.houyu.common.log.appender;
+
+import ch.qos.logback.classic.spi.ILoggingEvent;
+import com.lmax.disruptor.EventFactory;
+
+public class LogEventEvent {
+    private ILoggingEvent loggingEvent;
     
-    <!-- 根日志级别 -->
-    <root level="INFO">
-        <appender-ref ref="HY_COMMON_LOG"/>
-    </root>
-</configuration>
+    public ILoggingEvent getLoggingEvent() {
+        return loggingEvent;
+    }
+    
+    public void setLoggingEvent(ILoggingEvent loggingEvent) {
+        this.loggingEvent = loggingEvent;
+    }
+    
+    public static EventFactory<LogEventEvent> getFactory() {
+        return LogEventEvent::new;
+    }
+}
+```
+
+#### 4.1.4 LogEventHandler 事件处理器
+
+```java
+package com.houyu.common.log.appender;
+
+import com.houyu.common.log.converter.LogEventConverter;
+import com.houyu.common.log.model.HyLogEvent;
+import com.houyu.common.log.output.LogOutputManager;
+import com.lmax.disruptor.EventHandler;
+
+public class LogEventHandler implements EventHandler<LogEventEvent> {
+    
+    private final LogEventConverter converter = new LogEventConverter();
+    private final LogOutputManager outputManager = LogOutputManager.getInstance();
+    
+    @Override
+    public void onEvent(LogEventEvent event, long sequence, boolean endOfBatch) {
+        // 转换为统一 HyLogEvent 模型
+        HyLogEvent hyLogEvent = converter.convert(event.getLoggingEvent());
+        
+        // 输出到各个目标（控制台、文件、DB）
+        outputManager.output(hyLogEvent);
+    }
+}
+```
+
+#### 4.1.5 LogAutoConfiguration 编程式注册
+
+```java
+package com.houyu.common.log.config;
+
+import ch.qos.logback.classic.Logger;
+import ch.qos.logback.classic.LoggerContext;
+import com.houyu.common.log.appender.HyCommonLogAppender;
+import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
+import org.springframework.boot.context.properties.EnableConfigurationProperties;
+import org.springframework.context.annotation.Configuration;
+
+import javax.annotation.PostConstruct;
+
+@Configuration
+@EnableConfigurationProperties(LogProperties.class)
+@ConditionalOnProperty(prefix = "hy.log", name = "enabled", havingValue = "true", matchIfMissing = true)
+public class LogAutoConfiguration {
+    
+    @Autowired
+    private LogProperties logProperties;
+    
+    @PostConstruct
+    public void init() {
+        // 获取 Logback 上下文
+        LoggerContext loggerContext = (LoggerContext) LoggerFactory.getILoggerFactory();
+        
+        // 创建并配置自定义 Appender
+        HyCommonLogAppender appender = new HyCommonLogAppender(
+                logProperties.getAppender().getBufferSize()
+        );
+        appender.setContext(loggerContext);
+        appender.setName("HY_COMMON_LOG");
+        appender.start();
+        
+        // 获取根 Logger 并添加 Appender
+        Logger rootLogger = loggerContext.getLogger(Logger.ROOT_LOGGER_NAME);
+        rootLogger.addAppender(appender);
+    }
+}
 ```
 
 ### 4.2 统一 LogEvent 模型
