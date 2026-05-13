@@ -529,68 +529,316 @@ public class HttpResponseInfo {
 
 #### 4.3.1 TraceId 生成策略
 
-采用 **雪花算法（Snowflake）** 作为 TraceId 的基础生成策略，保证分布式环境下的唯一性。
-
-#### 4.3.2 雪花算法实现
+采用 **19位十进制数字** 作为全局唯一 TraceId 格式：
 
 ```
-Snowflake ID 结构 (64位):
-
-  1 bit      41 bits                5 bits       5 bits         12 bits
-┌───────┬──────────────────────┬────────────┬────────────┬──────────────────┐
-│  0    │  时间戳(毫秒级)       │  数据中心ID │  工作机器ID  │  序列号            │
-└───────┴──────────────────────┴────────────┴────────────┴──────────────────┘
-
-说明:
-- 第1位: 符号位，固定为 0（正数）
-- 41位时间戳: 支持使用约 69 年 (2^41-1 毫秒 ≈ 69年)
-- 5位数据中心ID: 支持最多 32 个数据中心
-- 5位工作机器ID: 支持最多 32 个工作机器
-- 12位序列号: 每毫秒最多生成 4096 个 ID
+┌──────────────────┬──────────────────┬──────────────────┬──────────────┐
+│   10位 时间戳     │    4位 机器码     │   4位 自增序列    │   1位 标志位  │
+│  (yyMMddHHmm)    │  (Redis注册)      │  (进程内唯一)     │  (调用方传入) │
+└──────────────────┴──────────────────┴──────────────────┴──────────────┘
 ```
 
-#### 4.3.3 生成器接口设计
+**字段详细说明：**
+
+| 字段 | 长度 | 格式/范围 | 说明 |
+|------|------|-----------|------|
+| **时间戳** | 10位 | `yyMMddHHmm` | 年月日时分格式，例如：2605131430 |
+| **机器码** | 4位 | `0000~9999` | 整个集群唯一，服务启动时注册到 Redis |
+| **自增序列** | 4位 | `0000~9999` | 进程内唯一，每分钟重置归零 |
+| **标志位** | 1位 | `0~9` | 调用方传入（1~9），非法或不传默认为 0 |
+
+**示例 TraceId：** `2605131430123456780`
+- 时间戳: 2605131430 (2026年5月13日14:30)
+- 机器码: 1234
+- 自增序列: 5678
+- 标志位: 0
+
+#### 4.3.2 机器码注册机制（Redis）
 
 ```java
 package com.houyu.common.log.trace;
 
-public interface TraceIdGenerator {
+import org.springframework.data.redis.core.RedisTemplate;
+import org.springframework.data.redis.core.script.DefaultRedisScript;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.stereotype.Component;
+
+import javax.annotation.PostConstruct;
+import javax.annotation.PreDestroy;
+import java.util.Collections;
+import java.util.UUID;
+
+@Component
+public class MachineIdManager {
+    
+    private static final String MACHINE_ID_KEY = "log:trace:machine_id";
+    private static final String MACHINE_LOCK_PREFIX = "log:trace:machine_lock:";
+    private static final int MAX_MACHINE_ID = 9999;
+    private static final long LOCK_EXPIRE_SECONDS = 60;
+    
+    @Autowired
+    private RedisTemplate<String, String> redisTemplate;
+    
+    private String instanceId;
+    private String machineId;
+    
+    @PostConstruct
+    public void init() {
+        instanceId = UUID.randomUUID().toString();
+        machineId = registerMachineId();
+    }
     
     /**
-     * 生成 TraceId
-     * @return 全局唯一的 TraceId
+     * 注册机器码（使用 Lua 脚本保证原子性）
      */
-    String generateTraceId();
+    private String registerMachineId() {
+        // Lua 脚本：查找第一个空闲的机器码并锁定
+        String luaScript = 
+            "for i = 0, 9999 do " +
+            "  local lockKey = KEYS[1] .. tostring(i) " +
+            "  if redis.call('setnx', lockKey, ARGV[1]) == 1 then " +
+            "    redis.call('expire', lockKey, ARGV[2]) " +
+            "    return tostring(i) " +
+            "  end " +
+            "end " +
+            "return nil";
+        
+        DefaultRedisScript<String> script = new DefaultRedisScript<>();
+        script.setScriptText(luaScript);
+        script.setResultType(String.class);
+        
+        String result = redisTemplate.execute(script,
+            Collections.singletonList(MACHINE_LOCK_PREFIX),
+            instanceId,
+            String.valueOf(LOCK_EXPIRE_SECONDS));
+        
+        if (result != null) {
+            // 补零到4位
+            return String.format("%04d", Integer.parseInt(result));
+        }
+        
+        // 兜底：如果所有机器码都被占用，使用IP哈希取模
+        return getFallbackMachineId();
+    }
     
     /**
-     * 生成 SpanId
-     * @return 当前跨度ID
+     * 兜底机器码生成策略
      */
-    String generateSpanId();
+    private String getFallbackMachineId() {
+        try {
+            String ip = InetAddress.getLocalHost().getHostAddress();
+            int hash = Math.abs(ip.hashCode()) % 10000;
+            return String.format("%04d", hash);
+        } catch (Exception e) {
+            // 终极兜底：随机数
+            return String.format("%04d", (int)(Math.random() * 10000));
+        }
+    }
     
     /**
-     * 生成子 SpanId
-     * @param parentSpanId 父 SpanId
-     * @return 子 SpanId
+     * 定时续期锁（每分钟执行）
      */
-    String generateChildSpanId(String parentSpanId);
+    @Scheduled(fixedRate = 30000)
+    public void renewLock() {
+        if (machineId != null) {
+            String lockKey = MACHINE_LOCK_PREFIX + machineId;
+            redisTemplate.expire(lockKey, LOCK_EXPIRE_SECONDS, TimeUnit.SECONDS);
+        }
+    }
+    
+    @PreDestroy
+    public void destroy() {
+        // 服务停止时释放机器码
+        if (machineId != null) {
+            String lockKey = MACHINE_LOCK_PREFIX + machineId;
+            String currentOwner = redisTemplate.opsForValue().get(lockKey);
+            if (instanceId.equals(currentOwner)) {
+                redisTemplate.delete(lockKey);
+            }
+        }
+    }
+    
+    public String getMachineId() {
+        return machineId;
+    }
 }
 ```
 
-#### 4.3.4 链路传递规则
+#### 4.3.3 自增序列设计（进程内唯一 + 兜底机制）
 
-1. **入站请求**: 从 HTTP Header 中提取 `X-Trace-Id`、`X-Span-Id`
-   - 如果存在 TraceId，则继续使用
-   - 如果不存在，则生成新的 TraceId
-   
-2. **出站请求**: 自动在 HTTP Header 中添加链路信息
+```java
+package com.houyu.common.log.trace;
+
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.locks.ReentrantLock;
+
+public class SequenceGenerator {
+    
+    private static final int MAX_SEQUENCE = 9999;
+    
+    // 主序列生成器
+    private final AtomicInteger sequence = new AtomicInteger(0);
+    
+    // 兜底序列（当主序列溢出时使用）
+    private final AtomicInteger fallbackSequence = new AtomicInteger(0);
+    
+    // 上一次重置的时间戳（yyMMddHHmm）
+    private volatile String lastResetTimestamp = "";
+    
+    // 重置锁
+    private final ReentrantLock resetLock = new ReentrantLock();
+    
+    /**
+     * 获取下一个序列值
+     * @param currentTimestamp 当前时间戳（yyMMddHHmm）
+     */
+    public int nextSequence(String currentTimestamp) {
+        // 检查是否需要重置序列（新的一分钟）
+        if (!currentTimestamp.equals(lastResetTimestamp)) {
+            resetIfNeeded(currentTimestamp);
+        }
+        
+        // 尝试使用主序列
+        int current = sequence.getAndIncrement();
+        if (current <= MAX_SEQUENCE) {
+            return current;
+        }
+        
+        // 主序列溢出，使用兜底序列（循环使用）
+        int fallback = fallbackSequence.getAndIncrement() % (MAX_SEQUENCE + 1);
+        return fallback;
+    }
+    
+    private void resetIfNeeded(String currentTimestamp) {
+        if (resetLock.tryLock()) {
+            try {
+                // 双重检查
+                if (!currentTimestamp.equals(lastResetTimestamp)) {
+                    sequence.set(0);
+                    fallbackSequence.set(0);
+                    lastResetTimestamp = currentTimestamp;
+                }
+            } finally {
+                resetLock.unlock();
+            }
+        }
+    }
+}
+```
+
+#### 4.3.4 标志位处理逻辑
+
+标志位来源：
+1. 从 HTTP Header `X-Trace-Flag` 提取
+2. 从 RPC 上下文 `traceFlag` 提取
+3. 从线程上下文 `TraceContextHolder` 提取
+
+处理规则：
+- 传入值在 `1~9` 范围内：使用传入值
+- 传入值不在范围内或未传入：默认使用 `0`
+
+```java
+public class FlagValidator {
+    
+    public static String normalizeFlag(String flag) {
+        if (flag == null || flag.length() != 1) {
+            return "0";
+        }
+        char c = flag.charAt(0);
+        if (c >= '1' && c <= '9') {
+            return flag;
+        }
+        return "0";
+    }
+}
+```
+
+#### 4.3.5 生成器完整实现
+
+```java
+package com.houyu.common.log.trace;
+
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.stereotype.Component;
+
+import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
+
+@Component
+public class DefaultTraceIdGenerator implements TraceIdGenerator {
+    
+    private static final DateTimeFormatter TIMESTAMP_FORMATTER = 
+        DateTimeFormatter.ofPattern("yyMMddHHmm");
+    
+    @Autowired
+    private MachineIdManager machineIdManager;
+    
+    private final SequenceGenerator sequenceGenerator = new SequenceGenerator();
+    
+    @Override
+    public String generateTraceId() {
+        return generateTraceId(null);
+    }
+    
+    /**
+     * 生成带标志位的 TraceId
+     * @param flag 标志位（1~9）
+     */
+    public String generateTraceId(String flag) {
+        // 1. 生成10位时间戳 (yyMMddHHmm)
+        String timestamp = LocalDateTime.now().format(TIMESTAMP_FORMATTER);
+        
+        // 2. 获取4位机器码
+        String machineId = machineIdManager.getMachineId();
+        
+        // 3. 获取4位自增序列
+        int sequence = sequenceGenerator.nextSequence(timestamp);
+        String sequenceStr = String.format("%04d", sequence);
+        
+        // 4. 处理1位标志位
+        String flagStr = FlagValidator.normalizeFlag(flag);
+        
+        // 拼接19位 TraceId
+        return timestamp + machineId + sequenceStr + flagStr;
+    }
+    
+    @Override
+    public String generateSpanId() {
+        // SpanId 使用相同算法，但标志位固定为 9
+        return generateTraceId("9");
+    }
+    
+    @Override
+    public String generateChildSpanId(String parentSpanId) {
+        // 子 SpanId = 父 SpanId + 3位子序列
+        int subSequence = sequenceGenerator.nextSequence(
+            LocalDateTime.now().format(TIMESTAMP_FORMATTER)) % 1000;
+        return parentSpanId + String.format("%03d", subSequence);
+    }
+}
+```
+
+#### 4.3.6 链路传递规则
+
+1. **入站请求**：从 HTTP Header / RPC 上下文提取链路信息
+   - `X-Trace-Id`: 链路追踪ID（19位）
+   - `X-Span-Id`: 当前跨度ID
+   - `X-Trace-Flag`: 标志位（1~9）
+   - 存在 TraceId 则继续使用，否则生成新的 TraceId
+
+2. **出站请求**：自动在 HTTP Header / RPC 上下文添加链路信息
    - `X-Trace-Id`: 当前链路 TraceId
    - `X-Span-Id`: 新生成的 SpanId
    - `X-Parent-Span-Id`: 当前 SpanId
+   - `X-Trace-Flag`: 标志位（透传）
 
-3. **MDC 集成**: 自动将链路信息放入 MDC
+3. **MDC 集成**：自动将链路信息放入 MDC
    - `traceId`: 链路追踪ID
    - `spanId`: 当前跨度ID
+   - `traceFlag`: 标志位
+
+4. **线程上下文传递**：通过 `TraceContextHolder` 跨线程传递
+   - 支持线程池场景（使用 `TraceableExecutorService` 包装）
 
 ### 4.4 日志格式规范
 
@@ -601,8 +849,8 @@ public interface TraceIdGenerator {
   "eventId": "event-xxx-yyy-zzz",
   "timestamp": "2026-05-13T10:30:00.000+08:00",
   "level": "INFO",
-  "traceId": "1792345678901234567",
-  "spanId": "span-001",
+  "traceId": "1778654087010100421",
+  "spanId": "1778654087010100439",
   "parentSpanId": null,
   "serviceName": "hy-user",
   "className": "com.houyu.user.service.UserService",
@@ -632,7 +880,7 @@ public interface TraceIdGenerator {
 #### 4.4.2 文本格式（开发环境推荐）
 
 ```
-[2026-05-13 10:30:00.000] [INFO] [traceId=1792345678901234567] [service=hy-user]
+[2026-05-13 10:30:00.000] [INFO] [traceId=1778654087010100421] [service=hy-user]
   com.houyu.user.service.UserService.getUserById(123) - 查询用户信息成功
   userId=12345, duration=150ms, clientIp=10.0.0.50
   GET /api/user/12345?v=1 → 200 OK
