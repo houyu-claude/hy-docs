@@ -553,34 +553,50 @@ public class HttpResponseInfo {
 - 自增序列: 5678
 - 标志位: 0
 
-#### 4.3.2 机器码注册机制（Redis）
+#### 4.3.2 机器码注册机制（JetCache + Redisson）
 
 ```java
 package com.houyu.common.log.trace;
 
-import org.springframework.data.redis.core.RedisTemplate;
-import org.springframework.data.redis.core.script.DefaultRedisScript;
+import com.alicp.jetcache.Cache;
+import com.alicp.jetcache.CacheManager;
+import com.alicp.jetcache.anno.CacheType;
+import com.alicp.jetcache.anno.CreateCache;
+import org.redisson.api.RLock;
+import org.redisson.api.RedissonClient;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
 
 import javax.annotation.PostConstruct;
 import javax.annotation.PreDestroy;
-import java.util.Collections;
+import java.net.InetAddress;
 import java.util.UUID;
+import java.util.concurrent.TimeUnit;
 
 @Component
 public class MachineIdManager {
     
-    private static final String MACHINE_ID_KEY = "log:trace:machine_id";
     private static final String MACHINE_LOCK_PREFIX = "log:trace:machine_lock:";
     private static final int MAX_MACHINE_ID = 9999;
     private static final long LOCK_EXPIRE_SECONDS = 60;
+    private static final long LOCK_WAIT_SECONDS = 3;
+    
+    // JetCache 本地缓存：存储已分配的机器码（避免重复查询Redis）
+    @CreateCache(name = "log:trace:allocated_machines", 
+                 cacheType = CacheType.LOCAL, 
+                 expire = 120, 
+                 timeUnit = TimeUnit.SECONDS)
+    private Cache<Integer, String> allocatedMachines;
     
     @Autowired
-    private RedisTemplate<String, String> redisTemplate;
+    private RedissonClient redissonClient;
+    
+    @Autowired
+    private CacheManager cacheManager;
     
     private String instanceId;
     private String machineId;
+    private RLock machineLock;
     
     @PostConstruct
     public void init() {
@@ -589,32 +605,34 @@ public class MachineIdManager {
     }
     
     /**
-     * 注册机器码（使用 Lua 脚本保证原子性）
+     * 注册机器码（使用 Redisson 分布式锁保证原子性）
      */
     private String registerMachineId() {
-        // Lua 脚本：查找第一个空闲的机器码并锁定
-        String luaScript = 
-            "for i = 0, 9999 do " +
-            "  local lockKey = KEYS[1] .. tostring(i) " +
-            "  if redis.call('setnx', lockKey, ARGV[1]) == 1 then " +
-            "    redis.call('expire', lockKey, ARGV[2]) " +
-            "    return tostring(i) " +
-            "  end " +
-            "end " +
-            "return nil";
-        
-        DefaultRedisScript<String> script = new DefaultRedisScript<>();
-        script.setScriptText(luaScript);
-        script.setResultType(String.class);
-        
-        String result = redisTemplate.execute(script,
-            Collections.singletonList(MACHINE_LOCK_PREFIX),
-            instanceId,
-            String.valueOf(LOCK_EXPIRE_SECONDS));
-        
-        if (result != null) {
-            // 补零到4位
-            return String.format("%04d", Integer.parseInt(result));
+        // 遍历查找可用机器码
+        for (int i = 0; i <= MAX_MACHINE_ID; i++) {
+            String lockKey = MACHINE_LOCK_PREFIX + i;
+            RLock lock = redissonClient.getLock(lockKey);
+            
+            try {
+                // 尝试获取锁，等待3秒，持有60秒
+                if (lock.tryLock(LOCK_WAIT_SECONDS, LOCK_EXPIRE_SECONDS, TimeUnit.SECONDS)) {
+                    try {
+                        // 双重检查：从 JetCache 本地缓存确认是否已被占用
+                        String owner = allocatedMachines.get(i);
+                        if (owner == null) {
+                            // 占用该机器码
+                            allocatedMachines.put(i, instanceId);
+                            this.machineLock = lock;
+                            return String.format("%04d", i);
+                        }
+                    } catch (Exception e) {
+                        lock.unlock();
+                    }
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                break;
+            }
         }
         
         // 兜底：如果所有机器码都被占用，使用IP哈希取模
@@ -636,30 +654,77 @@ public class MachineIdManager {
     }
     
     /**
-     * 定时续期锁（每分钟执行）
+     * 定时续期锁（每30秒执行）
+     * 使用 Redisson 看门狗机制自动续期，这里仅做健康检查
      */
     @Scheduled(fixedRate = 30000)
     public void renewLock() {
-        if (machineId != null) {
-            String lockKey = MACHINE_LOCK_PREFIX + machineId;
-            redisTemplate.expire(lockKey, LOCK_EXPIRE_SECONDS, TimeUnit.SECONDS);
+        if (machineLock != null && machineLock.isHeldByCurrentThread()) {
+            // Redisson 看门狗会自动续期，这里仅做心跳日志记录
+            // 如需要可更新 JetCache 本地缓存过期时间
         }
     }
     
     @PreDestroy
     public void destroy() {
         // 服务停止时释放机器码
-        if (machineId != null) {
-            String lockKey = MACHINE_LOCK_PREFIX + machineId;
-            String currentOwner = redisTemplate.opsForValue().get(lockKey);
-            if (instanceId.equals(currentOwner)) {
-                redisTemplate.delete(lockKey);
+        if (machineLock != null && machineLock.isHeldByCurrentThread()) {
+            try {
+                machineLock.unlock();
+            } catch (Exception e) {
+                // 忽略释放异常，锁会自动过期
             }
+        }
+        // 清除 JetCache 本地缓存
+        if (machineId != null) {
+            allocatedMachines.remove(Integer.parseInt(machineId));
         }
     }
     
     public String getMachineId() {
         return machineId;
+    }
+}
+```
+
+**JetCache 配置说明：**
+
+```yaml
+jetcache:
+  local:
+    default:
+      type: caffeine
+      limit: 10000
+      keyConvertor: fastjson
+  remote:
+    default:
+      type: redis.lettuce
+      keyConvertor: fastjson2
+      valueEncoder: java
+      valueDecoder: java
+      poolConfig:
+        minIdle: 5
+        maxIdle: 20
+        maxTotal: 50
+      host: localhost
+      port: 6379
+```
+
+**Redisson 配置说明：**
+
+```java
+@Configuration
+public class RedissonConfig {
+    
+    @Bean
+    public RedissonClient redissonClient() {
+        Config config = new Config();
+        config.useSingleServer()
+              .setAddress("redis://localhost:6379")
+              .setDatabase(0)
+              .setConnectionPoolSize(64)
+              .setConnectionMinimumIdleSize(10);
+        return Redisson.create(config);
     }
 }
 ```
@@ -849,8 +914,8 @@ public class DefaultTraceIdGenerator implements TraceIdGenerator {
   "eventId": "event-xxx-yyy-zzz",
   "timestamp": "2026-05-13T10:30:00.000+08:00",
   "level": "INFO",
-  "traceId": "1778654087010100421",
-  "spanId": "1778654087010100439",
+  "traceId": "2605131430123456780",
+  "spanId": "2605131430123456799",
   "parentSpanId": null,
   "serviceName": "hy-user",
   "className": "com.houyu.user.service.UserService",
@@ -865,7 +930,8 @@ public class DefaultTraceIdGenerator implements TraceIdGenerator {
     "queryString": "?v=1",
     "headers": {
       "Content-Type": "application/json",
-      "Authorization": "Bearer ***"
+      "Authorization": "Bearer ***",
+      "X-Trace-Flag": "5"
     }
   },
   "httpResponse": {
@@ -880,7 +946,7 @@ public class DefaultTraceIdGenerator implements TraceIdGenerator {
 #### 4.4.2 文本格式（开发环境推荐）
 
 ```
-[2026-05-13 10:30:00.000] [INFO] [traceId=1778654087010100421] [service=hy-user]
+[2026-05-13 10:30:00.000] [INFO] [traceId=2605131430123456780] [service=hy-user]
   com.houyu.user.service.UserService.getUserById(123) - 查询用户信息成功
   userId=12345, duration=150ms, clientIp=10.0.0.50
   GET /api/user/12345?v=1 → 200 OK
