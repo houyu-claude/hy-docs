@@ -3,12 +3,14 @@
 ## 1. 模块概述
 
 ### 1.1 模块定位
+
 - **模块名称**：hy-common-log
 - **父模块**：hy-common
 - **模块类型**：后端公共日志模块
 - **核心职责**：通过自定义 Logback Appender 接管所有日志输出，进行统一格式化、脱敏、过滤和持久化
 
 ### 1.2 设计目标
+
 - 统一日志格式规范（JSON/文本）
 - 提供可扩展的日志处理机制
 - 支持多种日志输出渠道（控制台、文件、数据库）
@@ -84,25 +86,25 @@
 
 ### 2.2 核心组件分层
 
-| 层级 | 组件名称 | 职责说明 |
-|------|---------|---------|
-| 接管层 | HyCommonLogAppender | 实现 AppenderBase，调用 prepareForDeferredProcessing 后以 tryNext 投递 Disruptor |
-| 转换层 | LogEventConverter | ILoggingEvent → HyLogEvent，补充上下文信息 |
-| 增强层 | LogDesensitizer | 日志脱敏处理器 |
-| 增强层 | LogFilter | 日志过滤器（按级别、关键词等） |
-| 增强层 | LogSampler | 日志采样器，降低高并发下的日志量 |
-| 格式化层 | LogFormatter | 日志格式化抽象接口 |
-| 格式化层 | JsonLogFormatter | JSON 格式日志实现 |
-| 格式化层 | TextLogFormatter | 文本格式日志实现 |
-| 输出层 | ConsoleLogOutput | 控制台同步输出 |
-| 输出层 | FileLogOutput | 文件异步输出 |
-| 输出层 | DbLogOutput | DB 后置处理，委托 AsyncDbLogWriter 批量写入 |
-| 输出层 | AsyncDbLogWriter | 批量缓冲 + 定时刷入，失败只计 metrics |
-| 输出层 | LogTableRouter | 根据 traceId 前6位（yyMMdd）路由到对应日分表 |
-| 链路层 | DefaultTraceIdGenerator | 生成19位 traceId（yyMMddHHmm+机器码+序列+标志） |
-| 链路层 | MachineIdManager | 通过 JetCache + Redisson RLock 注册机器码到 Redis |
-| 链路层 | SequenceGenerator | 进程内自增序列，每分钟重置 |
-| 链路层 | TraceContextHolder | 管理 MDC 上下文，支持跨线程传递 |
+| 层级   | 组件名称                    | 职责说明                                                                    |
+| ---- | ----------------------- | ----------------------------------------------------------------------- |
+| 接管层  | HyCommonLogAppender     | 实现 AppenderBase，调用 prepareForDeferredProcessing 后以 tryNext 投递 Disruptor |
+| 转换层  | LogEventConverter       | ILoggingEvent → HyLogEvent，补充上下文信息                                      |
+| 增强层  | LogDesensitizer         | 日志脱敏处理器                                                                 |
+| 增强层  | LogFilter               | 日志过滤器（按级别、关键词等）                                                         |
+| 增强层  | LogSampler              | 日志采样器，降低高并发下的日志量                                                        |
+| 格式化层 | LogFormatter            | 日志格式化抽象接口                                                               |
+| 格式化层 | JsonLogFormatter        | JSON 格式日志实现                                                             |
+| 格式化层 | TextLogFormatter        | 文本格式日志实现                                                                |
+| 输出层  | ConsoleLogOutput        | 控制台同步输出                                                                 |
+| 输出层  | FileLogOutput           | 文件异步输出                                                                  |
+| 输出层  | DbLogOutput             | DB 后置处理，委托 AsyncDbLogWriter 批量写入                                        |
+| 输出层  | AsyncDbLogWriter        | 批量缓冲 + 定时刷入，失败只计 metrics                                                |
+| 输出层  | LogTableRouter          | 根据 traceId 前6位（yyMMdd）路由到对应日分表                                          |
+| 链路层  | DefaultTraceIdGenerator | 生成19位 traceId（yyMMddHHmm+机器码+序列+标志）                                     |
+| 链路层  | MachineIdManager        | 通过 JetCache + Redisson RLock 注册机器码到 Redis                               |
+| 链路层  | SequenceGenerator       | 进程内自增序列，每分钟重置                                                           |
+| 链路层  | TraceContextHolder      | 管理 MDC 上下文，支持跨线程传递                                                      |
 
 ## 3. 模块结构
 
@@ -610,14 +612,15 @@ public class HttpResponseInfo {
 └──────────────────┴──────────────┴──────────────┴──────┘
 ```
 
-| 字段 | 长度 | 格式/范围 | 说明 |
-|------|------|-----------|------|
-| 时间戳 | 10位 | `yyMMddHHmm` | 年月日时分，例：2605131430 |
-| 机器码 | 4位 | `0000~9999` | 集群唯一，启动时通过 Redis 注册 |
-| 自增序列 | 4位 | `0000~9999` | 进程内唯一，每分钟重置归零 |
-| 标志位 | 1位 | `0~9` | 调用方传入 1~9，非法或不传默认为 0 |
+| 字段   | 长度  | 格式/范围        | 说明                    |
+| ---- | --- | ------------ | --------------------- |
+| 时间戳  | 10位 | `yyMMddHHmm` | 年月日时分，例：2605131430    |
+| 机器码  | 4位  | `0000~9999`  | 集群唯一，启动时通过 Redis 注册   |
+| 自增序列 | 4位  | `0000~9999`  | 进程内唯一，每分钟重置归零         |
+| 标志位  | 1位  | `0~9`        | 调用方传入 1\~9，非法或不传默认为 0 |
 
 **示例：** `2605131430001200010`
+
 - 时间戳：`2605131430`（2026-05-13 14:30）
 - 机器码：`0012`
 - 自增序列：`0001`
@@ -628,6 +631,7 @@ public class HttpResponseInfo {
 #### 4.3.2 机器码注册机制（JetCache + Redisson RLock）
 
 **设计要点：**
+
 - 使用 Redisson `RLock`（不指定 leaseTime）启用看门狗，进程存活期间锁自动续期
 - 使用 JetCache `CacheType.REMOTE`（Redis）存储已分配的机器码映射，跨实例共享
 - `@PreDestroy` 优雅停机时释放锁和缓存，机器码立即可被复用
@@ -806,12 +810,12 @@ public class SequenceGenerator {
 
 #### 4.3.4 标志位处理
 
-| 来源 | 优先级 |
-|------|--------|
+| 来源                         | 优先级   |
+| -------------------------- | ----- |
 | HTTP Header `X-Trace-Flag` | 1（最高） |
-| RPC 上下文 `traceFlag` | 2 |
-| `TraceContextHolder` 线程上下文 | 3 |
-| 默认值 | `0` |
+| RPC 上下文 `traceFlag`        | 2     |
+| `TraceContextHolder` 线程上下文 | 3     |
+| 默认值                        | `0`   |
 
 ```java
 public class FlagValidator {
@@ -886,11 +890,9 @@ public class DefaultTraceIdGenerator implements TraceIdGenerator {
 1. **入站请求**（优先级：MDC > HTTP Header > 本地生成）
    - 从 `X-Trace-Id` / `X-Span-Id` / `X-Trace-Flag` 提取，放入 MDC
    - 不存在则调用 `generateTraceId(flag)` 生成新 ID
-
 2. **出站请求**
    - 透传 `X-Trace-Id`，生成新 `X-Span-Id`，将当前 SpanId 设为 `X-Parent-Span-Id`
    - 透传 `X-Trace-Flag`
-
 3. **异步线程**
    - 使用 `TransmittableThreadLocal`（TTL）替代普通 `ThreadLocal`，防止线程池场景下 MDC 丢失
 
@@ -950,13 +952,13 @@ public class DefaultTraceIdGenerator implements TraceIdGenerator {
 
 #### 4.5.1 支持的脱敏类型
 
-| 类型 | 示例 | 脱敏后 |
-|------|------|--------|
-| 手机号 | 13812345678 | 138****5678 |
-| 邮箱 | test@example.com | te**@example.com |
-| 身份证 | 110101199001011234 | 110***********1234 |
-| 银行卡 | 6222021234567890123 | 6222***********0123 |
-| 密码 | password123 | ****** |
+| 类型  | 示例                  | 脱敏后                            |
+| --- | ------------------- | ------------------------------ |
+| 手机号 | 13812345678         | 138\*\*\*\*5678                |
+| 邮箱  | <test@example.com>  | te\*\*@example.com             |
+| 身份证 | 110101199001011234  | 110\*\*\*\*\*\*\*\*\*\*\*1234  |
+| 银行卡 | 6222021234567890123 | 6222\*\*\*\*\*\*\*\*\*\*\*0123 |
+| 密码  | password123         | \*\*\*\*\*\*                   |
 
 #### 4.5.2 脱敏注解
 
@@ -969,6 +971,7 @@ public @interface LogDesensitize {
 ```
 
 **运行时触发机制：**
+
 - **注解脱敏**：自定义 Jackson `JsonSerializer`，在对象序列化时扫描 `@LogDesensitize` 字段，仅在日志输出阶段生效，不影响业务对象本身
 - **正则兜底**：`DesensitizerManager` 对最终 message 字符串执行正则替换，作为字符串日志的兜底
 
@@ -977,6 +980,7 @@ public @interface LogDesensitize {
 #### 4.6.1 后置处理架构
 
 DB 存储是 **File 写入后的可选并行旁路**：
+
 - 主流程：`Disruptor → 格式化 → File 输出`（不受 DB 影响）
 - 旁路：File 写入完成后，`DbLogOutput` 将事件投递至 `AsyncDbLogWriter` 内存队列
 - DB 写入失败时：仅递增 `hy.log.db.failed` 指标，不抛异常，不影响主流程
@@ -1309,15 +1313,15 @@ CREATE INDEX idx_sys_log_http_resp_log_id ON sys_log_http_response (log_id);
 
 #### 4.6.5 分表策略说明
 
-| 项目 | 策略 |
-|------|------|
-| 分表粒度 | 按天，表名格式 `sys_log_yyyyMMdd` |
-| 路由键 | traceId 前6位（`yyMMdd`），由 `LogTableRouter.resolveTableName()` 解析 |
-| 建表时机 | 每天 23:55 由调度任务预建次日三张分表 |
-| 写入路由 | `AsyncDbLogWriter.flush()` 按目标表分组批量写入 |
-| 表结构同步 | `CREATE TABLE IF NOT EXISTS ... (LIKE base_table INCLUDING ALL)` 复制模板表全部结构 |
-| 数据保留 | 默认保留30天，超期表由每日 02:00 调度任务执行 `DROP TABLE` |
-| 无 traceId 兜底 | 路由到当天表（`sys_log_yyyyMMdd`） |
+| 项目           | 策略                                                                         |
+| ------------ | -------------------------------------------------------------------------- |
+| 分表粒度         | 按天，表名格式 `sys_log_yyyyMMdd`                                                 |
+| 路由键          | traceId 前6位（`yyMMdd`），由 `LogTableRouter.resolveTableName()` 解析             |
+| 建表时机         | 每天 23:55 由调度任务预建次日三张分表                                                     |
+| 写入路由         | `AsyncDbLogWriter.flush()` 按目标表分组批量写入                                      |
+| 表结构同步        | `CREATE TABLE IF NOT EXISTS ... (LIKE base_table INCLUDING ALL)` 复制模板表全部结构 |
+| 数据保留         | 默认保留30天，超期表由每日 02:00 调度任务执行 `DROP TABLE`                                   |
+| 无 traceId 兜底 | 路由到当天表（`sys_log_yyyyMMdd`）                                                 |
 
 ### 4.7 配置项设计
 
@@ -1430,6 +1434,7 @@ public interface Desensitizer {
 
 ## 8. 版本历史
 
-| 版本 | 日期 | 说明 |
-|------|------|------|
+| 版本    | 日期         | 说明                                                                              |
+| ----- | ---------- | ------------------------------------------------------------------------------- |
 | 1.0.0 | 2026-05-13 | 初始版本：编程式 Logback 接管、19位 traceId、JetCache+Redisson 机器码注册、PostgreSQL 日分表、API 重放支持 |
+
