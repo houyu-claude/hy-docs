@@ -30,7 +30,7 @@
 | 日志记录 | 网关访问日志记录 | 必须 |
 | 路由转发 | 请求路由至后端服务 | 必须 |
 | 熔断降级 | 服务熔断和降级处理 | 建议 |
-| 负载均衡 | 基于 Ribbon 的负载均衡 | 建议 |
+| 负载均衡 | 基于 Spring Cloud LoadBalancer 的负载均衡 | 建议 |
 
 ## 2. 架构设计
 
@@ -68,7 +68,7 @@
 │  │  │  DynamicRouteLocator (基于 Nacos 配置动态路由)                │    │   │
 │  │  │  - 路由规则配置                                                │    │   │
 │  │  │  - 服务发现 (Nacos Discovery)                                 │    │   │
-│  │  │  - 负载均衡 (Ribbon)                                          │    │   │
+│  │  │  - 负载均衡 (Spring Cloud LoadBalancer)                        │    │   │
 │  │  └────────────────────────────────┬──────────────────────────────┘    │   │
 │  └───────────────────────────────────┼───────────────────────────────────┘   │
 └──────────────────────────────────────┼───────────────────────────────────────┘
@@ -95,11 +95,11 @@
 | 过滤器层 | RequestLogFilter | 请求日志记录 |
 | 路由层 | DynamicRouteLocator | 基于 Nacos 的动态路由 |
 | 服务发现层 | NacosDiscoveryClient | 服务注册与发现 |
-| 负载均衡层 | RibbonLoadBalancer | 客户端负载均衡 |
+| 负载均衡层 | SpringCloudLoadBalancer | 客户端负载均衡 |
 | 日志层 | HyGatewayLogService | 网关日志服务（集成 hy-common-log） |
 | 配置层 | GatewayProperties | 网关配置属性 |
 | 限流层 | RateLimitManager | 限流管理器（基于 JetCache） |
-| 熔断层 | HystrixCircuitBreaker | 服务熔断降级 |
+| 配置层 | WhitelistProperties | 白名单配置属性 |
 
 ### 2.3 数据流
 
@@ -142,7 +142,9 @@ hy-gateway/
 │   │   │       ├── config/
 │   │   │       │   ├── GatewayAutoConfiguration.java
 │   │   │       │   ├── GatewayProperties.java
-│   │   │       │   └── NacosConfigProperties.java
+│   │   │       │   ├── NacosConfigProperties.java
+│   │   │       │   ├── WhitelistProperties.java
+│   │   │       │   └── CorsConfig.java
 │   │   │       ├── filter/
 │   │   │       │   ├── TraceFilter.java
 │   │   │       │   ├── TokenFilter.java
@@ -158,7 +160,8 @@ hy-gateway/
 │   │   │       │   ├── TokenService.java
 │   │   │       │   ├── AuthService.java
 │   │   │       │   ├── RateLimitService.java
-│   │   │       │   └── GatewayLogService.java
+│   │   │       │   ├── GatewayLogService.java
+│   │   │       │   └── PermissionClient.java
 │   │   │       ├── model/
 │   │   │       │   ├── GatewayLogEvent.java
 │   │   │       │   ├── RouteRule.java
@@ -197,9 +200,10 @@ hy-gateway/
 | RequestLogFilter | 记录请求日志到 hy-common-log | filter |
 | DynamicRouteLocator | 从 Nacos 配置中心加载动态路由规则 | route |
 | TokenService | Token 解析和验证逻辑 | service |
-| AuthService | 权限校验逻辑 | service |
+| AuthService | 权限校验逻辑，支持 JetCache + PermissionClient 加载权限数据 | service |
 | RateLimitService | 限流管理逻辑（基于 JetCache） | service |
 | GatewayLogService | 网关日志服务 | service |
+| PermissionClient | 权限数据远程调用客户端 | service |
 
 ## 4. 核心功能设计
 
@@ -219,9 +223,13 @@ import com.houyu.common.log.trace.TraceContextHolder;
 import org.springframework.cloud.gateway.filter.GatewayFilterChain;
 import org.springframework.cloud.gateway.filter.GlobalFilter;
 import org.springframework.core.Ordered;
+import org.springframework.http.HttpHeaders;
 import org.springframework.stereotype.Component;
 import org.springframework.web.server.ServerWebExchange;
 import reactor.core.publisher.Mono;
+
+import java.util.HashMap;
+import java.util.Map;
 
 @Component
 public class TraceFilter implements GlobalFilter, Ordered {
@@ -252,11 +260,14 @@ public class TraceFilter implements GlobalFilter, Ordered {
         TraceContextHolder.setSpanId(spanId);
         TraceContextHolder.setParentSpanId(incomingSpanId);
 
-        exchange.getRequest().mutate()
-                .header(TRACE_ID_HEADER, traceId)
-                .header(SPAN_ID_HEADER, spanId);
+        ServerWebExchange mutatedExchange = exchange.mutate()
+                .request(r -> r.headers(headers -> {
+                    headers.set(TRACE_ID_HEADER, traceId);
+                    headers.set(SPAN_ID_HEADER, spanId);
+                }))
+                .build();
 
-        return chain.filter(exchange).doFinally(signalType -> {
+        return chain.filter(mutatedExchange).doFinally(signalType -> {
             TraceContextHolder.clear();
         });
     }
@@ -339,14 +350,17 @@ public class TokenService {
 ```java
 package com.houyu.gateway.filter;
 
+import com.houyu.gateway.config.WhitelistProperties;
 import com.houyu.gateway.service.TokenService;
 import org.springframework.cloud.gateway.filter.GatewayFilterChain;
 import org.springframework.cloud.gateway.filter.GlobalFilter;
 import org.springframework.core.Ordered;
-import org.springframework.http.HttpHeaders;
+import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Component;
 import org.springframework.web.server.ServerWebExchange;
 import reactor.core.publisher.Mono;
+
+import java.util.List;
 
 @Component
 public class TokenFilter implements GlobalFilter, Ordered {
@@ -354,32 +368,54 @@ public class TokenFilter implements GlobalFilter, Ordered {
     private static final String AUTHORIZATION_HEADER = "Authorization";
 
     private final TokenService tokenService;
+    private final WhitelistProperties whitelistProperties;
 
-    public TokenFilter(TokenService tokenService) {
+    public TokenFilter(TokenService tokenService, WhitelistProperties whitelistProperties) {
         this.tokenService = tokenService;
+        this.whitelistProperties = whitelistProperties;
     }
 
     @Override
     public Mono<Void> filter(ServerWebExchange exchange, GatewayFilterChain chain) {
-        String token = exchange.getRequest().getHeaders().getFirst(AUTHORIZATION_HEADER);
+        String path = exchange.getRequest().getPath().value();
         
-        if (token != null && !token.isEmpty()) {
-            try {
-                String userId = tokenService.getUserIdFromToken(token);
-                String username = tokenService.getUsernameFromToken(token);
-                String tenantId = tokenService.getTenantIdFromToken(token);
-
-                exchange.getRequest().mutate()
-                        .header("X-User-Id", userId)
-                        .header("X-Username", username)
-                        .header("X-Tenant-Id", tenantId);
-            } catch (Exception e) {
-                exchange.getResponse().setStatusCode(org.springframework.http.HttpStatus.UNAUTHORIZED);
-                return exchange.getResponse().setComplete();
-            }
+        if (isWhitelisted(path)) {
+            return chain.filter(exchange);
         }
 
-        return chain.filter(exchange);
+        String token = exchange.getRequest().getHeaders().getFirst(AUTHORIZATION_HEADER);
+        
+        if (token == null || token.isEmpty()) {
+            exchange.getResponse().setStatusCode(HttpStatus.UNAUTHORIZED);
+            return exchange.getResponse().setComplete();
+        }
+
+        try {
+            String userId = tokenService.getUserIdFromToken(token);
+            String username = tokenService.getUsernameFromToken(token);
+            String tenantId = tokenService.getTenantIdFromToken(token);
+
+            ServerWebExchange mutatedExchange = exchange.mutate()
+                    .request(r -> r.headers(headers -> {
+                        headers.set("X-User-Id", userId);
+                        headers.set("X-Username", username);
+                        headers.set("X-Tenant-Id", tenantId);
+                    }))
+                    .build();
+
+            return chain.filter(mutatedExchange);
+        } catch (Exception e) {
+            exchange.getResponse().setStatusCode(HttpStatus.UNAUTHORIZED);
+            return exchange.getResponse().setComplete();
+        }
+    }
+
+    private boolean isWhitelisted(String path) {
+        List<String> whitelist = whitelistProperties.getPaths();
+        if (whitelist == null || whitelist.isEmpty()) {
+            return false;
+        }
+        return whitelist.stream().anyMatch(path::startsWith);
     }
 
     @Override
@@ -400,23 +436,36 @@ public class TokenFilter implements GlobalFilter, Ordered {
 ```java
 package com.houyu.gateway.service;
 
+import com.alicp.jetcache.Cache;
+import com.alicp.jetcache.anno.CacheType;
+import com.alicp.jetcache.anno.CreateCache;
 import com.houyu.gateway.exception.GatewayException;
 import org.springframework.stereotype.Service;
 
 import java.util.Set;
-import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.TimeUnit;
 
 @Service
 public class AuthService {
 
-    private final ConcurrentHashMap<String, Set<String>> userPermissions = new ConcurrentHashMap<>();
+    @CreateCache(name = "gateway:permissions:",
+                 cacheType = CacheType.REMOTE,
+                 expire = 300,
+                 timeUnit = TimeUnit.SECONDS)
+    private Cache<String, Set<String>> permissionCache;
+
+    private final PermissionClient permissionClient;
+
+    public AuthService(PermissionClient permissionClient) {
+        this.permissionClient = permissionClient;
+    }
 
     public void checkPermission(String userId, String uri, String method) {
         if (userId == null || userId.isEmpty()) {
             throw new GatewayException("UNAUTHORIZED", "User not authenticated");
         }
 
-        Set<String> permissions = userPermissions.getOrDefault(userId, Set.of());
+        Set<String> permissions = getPermissions(userId);
         
         String requiredPermission = buildPermissionKey(uri, method);
         
@@ -425,16 +474,20 @@ public class AuthService {
         }
     }
 
+    private Set<String> getPermissions(String userId) {
+        return permissionCache.computeIfAbsent(userId, this::loadPermissionsFromRemote);
+    }
+
+    private Set<String> loadPermissionsFromRemote(String userId) {
+        return permissionClient.fetchUserPermissions(userId);
+    }
+
     private String buildPermissionKey(String uri, String method) {
         return method.toUpperCase() + ":" + uri;
     }
 
-    public void loadUserPermissions(String userId, Set<String> permissions) {
-        userPermissions.put(userId, permissions);
-    }
-
-    public void clearUserPermissions(String userId) {
-        userPermissions.remove(userId);
+    public void refreshUserPermissions(String userId) {
+        permissionCache.remove(userId);
     }
 }
 ```
@@ -952,6 +1005,99 @@ public class RouteRule {
 }
 ```
 
+### 4.8 白名单路由机制
+
+#### 4.8.1 设计说明
+
+支持配置无需 Token 验证的白名单路径，用于开放接口如登录、健康检查等。白名单配置通过 `WhitelistProperties` 管理，并与 `TokenFilter` 联动。
+
+#### 4.8.2 WhitelistProperties 实现
+
+```java
+package com.houyu.gateway.config;
+
+import lombok.Data;
+import org.springframework.boot.context.properties.ConfigurationProperties;
+import org.springframework.stereotype.Component;
+
+import java.util.ArrayList;
+import java.util.List;
+
+@Data
+@Component
+@ConfigurationProperties(prefix = "hy.gateway.whitelist")
+public class WhitelistProperties {
+
+    private List<String> paths = new ArrayList<>();
+}
+```
+
+### 4.9 CORS 跨域配置
+
+#### 4.9.1 设计说明
+
+通过 `CorsWebFilter` 实现全局跨域配置，支持配置允许的源、方法、请求头和凭证。
+
+#### 4.9.2 CorsConfig 实现
+
+```java
+package com.houyu.gateway.config;
+
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.web.cors.CorsConfiguration;
+import org.springframework.web.cors.reactive.CorsWebFilter;
+import org.springframework.web.cors.reactive.UrlBasedCorsConfigurationSource;
+
+import java.util.Arrays;
+import java.util.List;
+
+@Configuration
+public class CorsConfig {
+
+    @Bean
+    public CorsWebFilter corsWebFilter() {
+        CorsConfiguration config = new CorsConfiguration();
+        
+        config.setAllowedOriginPatterns(List.of("http://localhost:3000", "https://*.houyu.com"));
+        config.setAllowedMethods(Arrays.asList("GET", "POST", "PUT", "DELETE", "OPTIONS"));
+        config.setAllowedHeaders(List.of("*"));
+        config.setAllowCredentials(true);
+        config.setMaxAge(3600L);
+
+        UrlBasedCorsConfigurationSource source = new UrlBasedCorsConfigurationSource();
+        source.registerCorsConfiguration("/**", config);
+
+        return new CorsWebFilter(source);
+    }
+}
+```
+
+### 4.10 PermissionClient 权限数据加载
+
+#### 4.10.1 设计说明
+
+通过 `PermissionClient` 从权限服务获取用户权限数据，配合 `JetCache` 缓存权限信息，减少远程调用。
+
+#### 4.10.2 PermissionClient 实现
+
+```java
+package com.houyu.gateway.service;
+
+import org.springframework.cloud.openfeign.FeignClient;
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.RequestParam;
+
+import java.util.Set;
+
+@FeignClient(name = "hy-auth")
+public interface PermissionClient {
+
+    @GetMapping("/api/permission/user")
+    Set<String> fetchUserPermissions(@RequestParam("userId") String userId);
+}
+```
+
 ## 5. Maven 依赖配置
 
 ```xml
@@ -1009,25 +1155,21 @@ public class RouteRule {
         <dependency>
             <groupId>com.alicp.jetcache</groupId>
             <artifactId>jetcache-starter-redis-lettuce</artifactId>
-            <version>2.7.3</version>
         </dependency>
 
         <!-- JWT -->
         <dependency>
             <groupId>io.jsonwebtoken</groupId>
             <artifactId>jjwt-api</artifactId>
-            <version>0.12.5</version>
         </dependency>
         <dependency>
             <groupId>io.jsonwebtoken</groupId>
             <artifactId>jjwt-impl</artifactId>
-            <version>0.12.5</version>
             <scope>runtime</scope>
         </dependency>
         <dependency>
             <groupId>io.jsonwebtoken</groupId>
             <artifactId>jjwt-jackson</artifactId>
-            <version>0.12.5</version>
             <scope>runtime</scope>
         </dependency>
 
@@ -1035,7 +1177,6 @@ public class RouteRule {
         <dependency>
             <groupId>com.houyu</groupId>
             <artifactId>hy-common-log</artifactId>
-            <version>1.0.0-SNAPSHOT</version>
         </dependency>
 
         <!-- Lombok -->
@@ -1083,6 +1224,31 @@ hy:
       ip-limit: 100
       user-limit: 50
       uri-limit: 500
+    whitelist:
+      paths:
+        - /api/public/**
+        - /api/auth/login
+        - /health
+
+spring:
+  cloud:
+    gateway:
+      globalcors:
+        cors-configurations:
+          '[/**]':
+            allowed-origins:
+              - http://localhost:3000
+              - https://*.houyu.com
+            allowed-methods:
+              - GET
+              - POST
+              - PUT
+              - DELETE
+              - OPTIONS
+            allowed-headers:
+              - *
+            allow-credentials: true
+            max-age: 3600
 ```
 
 ### 6.2 Nacos 路由配置示例 (gateway-routes)
@@ -1114,93 +1280,9 @@ hy:
 ]
 ```
 
-## 7. 数据库表设计
+## 7. 异常处理
 
-### 7.1 网关访问日志表
-
-```sql
-CREATE TABLE gateway_access_log (
-    id                  BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-    trace_id            VARCHAR(19)     NOT NULL,
-    span_id             VARCHAR(19),
-    parent_span_id      VARCHAR(19),
-    client_ip           VARCHAR(64),
-    server_ip           VARCHAR(64),
-    http_method         VARCHAR(16),
-    request_uri         VARCHAR(1024),
-    query_string        TEXT,
-    request_headers     JSONB,
-    request_body        TEXT,
-    status_code         INT,
-    response_body       TEXT,
-    execution_time      BIGINT,
-    user_id             VARCHAR(64),
-    username            VARCHAR(128),
-    tenant_id           VARCHAR(64),
-    error_code          VARCHAR(64),
-    error_message       TEXT,
-    created_at          TIMESTAMPTZ     DEFAULT CURRENT_TIMESTAMP
-);
-
-COMMENT ON TABLE  gateway_access_log       IS '网关访问日志表';
-COMMENT ON COLUMN gateway_access_log.id     IS '主键ID';
-COMMENT ON COLUMN gateway_access_log.trace_id IS '链路追踪ID';
-COMMENT ON COLUMN gateway_access_log.span_id IS '跨度ID';
-COMMENT ON COLUMN gateway_access_log.parent_span_id IS '父跨度ID';
-COMMENT ON COLUMN gateway_access_log.client_ip IS '客户端IP';
-COMMENT ON COLUMN gateway_access_log.server_ip IS '服务器IP';
-COMMENT ON COLUMN gateway_access_log.http_method IS 'HTTP方法';
-COMMENT ON COLUMN gateway_access_log.request_uri IS '请求URI';
-COMMENT ON COLUMN gateway_access_log.query_string IS '查询参数';
-COMMENT ON COLUMN gateway_access_log.request_headers IS '请求头(JSON)';
-COMMENT ON COLUMN gateway_access_log.request_body IS '请求体';
-COMMENT ON COLUMN gateway_access_log.status_code IS 'HTTP状态码';
-COMMENT ON COLUMN gateway_access_log.response_body IS '响应体';
-COMMENT ON COLUMN gateway_access_log.execution_time IS '执行耗时(毫秒)';
-COMMENT ON COLUMN gateway_access_log.user_id IS '用户ID';
-COMMENT ON COLUMN gateway_access_log.username IS '用户名';
-COMMENT ON COLUMN gateway_access_log.tenant_id IS '租户ID';
-COMMENT ON COLUMN gateway_access_log.error_code IS '错误码';
-COMMENT ON COLUMN gateway_access_log.error_message IS '错误消息';
-COMMENT ON COLUMN gateway_access_log.created_at IS '创建时间';
-
-CREATE INDEX idx_gateway_log_trace_id ON gateway_access_log(trace_id);
-CREATE INDEX idx_gateway_log_client_ip ON gateway_access_log(client_ip);
-CREATE INDEX idx_gateway_log_created_at ON gateway_access_log(created_at);
-```
-
-### 7.2 限流规则配置表
-
-```sql
-CREATE TABLE gateway_rate_limit_config (
-    id                  BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-    limit_key           VARCHAR(256)    NOT NULL UNIQUE,
-    limit_type          VARCHAR(32)     NOT NULL,
-    max_requests        INT             NOT NULL DEFAULT 100,
-    time_window_seconds INT             NOT NULL DEFAULT 60,
-    description         VARCHAR(512),
-    enabled             BOOLEAN         DEFAULT TRUE,
-    created_at          TIMESTAMPTZ     DEFAULT CURRENT_TIMESTAMP,
-    updated_at          TIMESTAMPTZ     DEFAULT CURRENT_TIMESTAMP
-);
-
-COMMENT ON TABLE  gateway_rate_limit_config      IS '限流规则配置表';
-COMMENT ON COLUMN gateway_rate_limit_config.id   IS '主键ID';
-COMMENT ON COLUMN gateway_rate_limit_config.limit_key IS '限流键(IP/用户/URI)';
-COMMENT ON COLUMN gateway_rate_limit_config.limit_type IS '限流类型(IP/USER/URI)';
-COMMENT ON COLUMN gateway_rate_limit_config.max_requests IS '最大请求数';
-COMMENT ON COLUMN gateway_rate_limit_config.time_window_seconds IS '时间窗口(秒)';
-COMMENT ON COLUMN gateway_rate_limit_config.description IS '描述';
-COMMENT ON COLUMN gateway_rate_limit_config.enabled IS '是否启用';
-COMMENT ON COLUMN gateway_rate_limit_config.created_at IS '创建时间';
-COMMENT ON COLUMN gateway_rate_limit_config.updated_at IS '更新时间';
-
-CREATE UNIQUE INDEX idx_rate_limit_key ON gateway_rate_limit_config(limit_key);
-```
-
-## 8. 异常处理
-
-### 8.1 异常类型
+### 7.1 异常类型
 
 | 异常码 | 异常信息 | HTTP状态码 |
 | ------ | -------- | ---------- |
@@ -1213,7 +1295,7 @@ CREATE UNIQUE INDEX idx_rate_limit_key ON gateway_rate_limit_config(limit_key);
 | RATE_LIMIT_URI | URI rate limit exceeded | 429 |
 | BAD_REQUEST | Bad request | 400 |
 
-### 8.2 GatewayExceptionHandler 实现
+### 7.2 GatewayExceptionHandler 实现
 
 ```java
 package com.houyu.gateway.exception;
@@ -1252,7 +1334,7 @@ public class GatewayExceptionHandler {
 }
 ```
 
-## 9. 监控指标
+## 8. 监控指标
 
 | 指标名称 | 类型 | 说明 |
 | -------- | ---- | ---- |
@@ -1266,7 +1348,7 @@ public class GatewayExceptionHandler {
 | hy.gateway.errors.token | Counter | Token验证失败次数 |
 | hy.gateway.errors.auth | Counter | 权限校验失败次数 |
 
-## 10. 安全考虑
+## 9. 安全考虑
 
 1. **敏感信息保护**：日志中不记录完整的 Token 和密码等敏感信息
 2. **请求体限制**：限制最大请求体大小，防止 DoS 攻击
