@@ -60,6 +60,11 @@
 │  │                     │ AuditAspect  │                                 │   │
 │  │                     │  审计日志    │                                 │   │
 │  │                     └──────────────┘                                 │   │
+│  │                     ┌──────────────┐                                 │   │
+│  │                     │GlobalException│                                 │   │
+│  │                     │   Handler    │                                 │   │
+│  │                     │ @ControllerAdv│                                 │   │
+│  │                     └──────────────┘                                 │   │
 │  └────────────────────────────────┬───────────────────────────────────┘   │
 └───────────────────────────────────┼───────────────────────────────────────┘
                                     │
@@ -68,10 +73,10 @@
 │                           Manager 层                                      │
 │  ┌──────────────────────────────────────────────────────────────────────┐   │
 │  │                     Manager AOP (Aspect)                             │   │
-│  │  ┌──────────────┐  ┌──────────────┐                                 │   │
-│  │  │  LogAspect   │  │TransactionAspect│                             │   │
-│  │  │  日志记录    │  │  事务管理    │                                 │   │
-│  │  └──────────────┘  └──────────────┘                                 │   │
+│  │  ┌──────────────┐                                                   │   │
+│  │  │  LogAspect   │         @Transactional(rollbackFor)                │   │
+│  │  │  日志记录    │         方法直接标注事务注解                         │   │
+│  │  └──────────────┘                                                   │   │
 │  └────────────────────────────────┬───────────────────────────────────┘   │
 └───────────────────────────────────┼───────────────────────────────────────┘
                                     │
@@ -97,8 +102,8 @@
 │  │  │    分表处理   │  │   数据权限    │  │   分页限制   │              │   │
 │  │  └──────────────┘  └──────────────┘  └──────────────┘              │   │
 │  │                     ┌──────────────┐                                 │   │
-│  │                     │ SqlLogInterceptor│                             │   │
-│  │                     │   SQL日志记录   │                             │   │
+│  │                     │    p6spy     │                                 │   │
+│  │                     │  SQL日志记录  │                                 │   │
 │  │                     └──────────────┘                                 │   │
 │  └────────────────────────────────┬───────────────────────────────────┘   │
 └───────────────────────────────────┼───────────────────────────────────────┘
@@ -157,7 +162,8 @@ hy-common-app/
 │   │   │       │   │   ├── ControllerLogAspect.java
 │   │   │       │   │   ├── IdempotentAspect.java
 │   │   │       │   │   ├── AuthAspect.java
-│   │   │       │   │   └── AuditAspect.java
+│   │   │       │   │   ├── AuditAspect.java
+│   │   │       │   │   └── GlobalExceptionHandler.java
 │   │   │       │   ├── manager/
 │   │   │       │   │   └── ManagerLogAspect.java
 │   │   │       │   └── service/
@@ -353,13 +359,17 @@ import com.houyu.common.log.model.HttpRequestInfo;
 import com.houyu.common.log.model.HttpResponseInfo;
 import com.houyu.common.log.output.LogOutputManager;
 import jakarta.servlet.http.HttpServletRequest;
+import jakarta.servlet.http.HttpServletResponse;
 import org.aspectj.lang.ProceedingJoinPoint;
 import org.aspectj.lang.annotation.Around;
 import org.aspectj.lang.annotation.Aspect;
+import org.springframework.http.MediaType;
 import org.springframework.stereotype.Component;
 import org.springframework.web.context.request.RequestContextHolder;
 import org.springframework.web.context.request.ServletRequestAttributes;
+import org.springframework.web.util.ContentCachingRequestWrapper;
 
+import java.nio.charset.StandardCharsets;
 import java.time.LocalDateTime;
 import java.util.HashMap;
 import java.util.Map;
@@ -529,10 +539,10 @@ public class IdempotentAspect {
 
         try {
             Object result = joinPoint.proceed();
-            idempotentService.store(key, IdempotentStatus.SUCCESS);
+            idempotentService.storeSuccess(key);
             return result;
         } catch (Exception e) {
-            idempotentService.store(key, IdempotentStatus.FAILED);
+            idempotentService.remove(key);
             throw e;
         }
     }
@@ -565,22 +575,42 @@ import java.util.concurrent.TimeUnit;
 @Service
 public class IdempotentService {
 
-    @CreateCache(name = "app:idempotent:",
+    @CreateCache(name = "app:idempotent:processing:",
+                 cacheType = CacheType.REMOTE,
+                 expire = 30,
+                 timeUnit = TimeUnit.SECONDS)
+    private Cache<String, IdempotentStatus> processingCache;
+
+    @CreateCache(name = "app:idempotent:success:",
                  cacheType = CacheType.REMOTE,
                  expire = 300,
                  timeUnit = TimeUnit.SECONDS)
-    private Cache<String, IdempotentStatus> idempotentCache;
+    private Cache<String, IdempotentStatus> successCache;
 
     public IdempotentStatus getStatus(String key) {
-        return idempotentCache.get(key);
+        IdempotentStatus processing = processingCache.get(key);
+        if (processing != null) {
+            return processing;
+        }
+        return successCache.get(key);
     }
 
     public void store(String key, IdempotentStatus status) {
-        idempotentCache.put(key, status);
+        if (status == IdempotentStatus.PROCESSING) {
+            processingCache.put(key, status);
+        } else {
+            successCache.put(key, status);
+        }
+    }
+
+    public void storeSuccess(String key) {
+        processingCache.remove(key);
+        successCache.put(key, IdempotentStatus.SUCCESS);
     }
 
     public void remove(String key) {
-        idempotentCache.remove(key);
+        processingCache.remove(key);
+        successCache.remove(key);
     }
 }
 ```
@@ -729,6 +759,107 @@ import java.lang.annotation.*;
 public @interface AuditLog {
     String description();
     String module() default "";
+}
+```
+
+#### 4.2.8 GlobalExceptionHandler 实现
+
+```java
+package com.houyu.common.app.aop.controller;
+
+import com.houyu.common.app.context.RequestContextHolder;
+import com.houyu.common.log.model.HyLogEvent;
+import com.houyu.common.log.output.LogOutputManager;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ResponseEntity;
+import org.springframework.validation.BindingResult;
+import org.springframework.validation.FieldError;
+import org.springframework.web.bind.MethodArgumentNotValidException;
+import org.springframework.web.bind.annotation.ControllerAdvice;
+import org.springframework.web.bind.annotation.ExceptionHandler;
+
+import java.time.LocalDateTime;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.stream.Collectors;
+
+@ControllerAdvice
+public class GlobalExceptionHandler {
+
+    private final LogOutputManager logOutputManager;
+
+    public GlobalExceptionHandler(LogOutputManager logOutputManager) {
+        this.logOutputManager = logOutputManager;
+    }
+
+    @ExceptionHandler(MethodArgumentNotValidException.class)
+    public ResponseEntity<Map<String, Object>> handleValidationException(
+            MethodArgumentNotValidException ex) {
+        
+        BindingResult bindingResult = ex.getBindingResult();
+        List<String> errors = bindingResult.getFieldErrors().stream()
+                .map(FieldError::getDefaultMessage)
+                .collect(Collectors.toList());
+
+        logException(ex, HttpStatus.BAD_REQUEST.value());
+
+        Map<String, Object> response = new HashMap<>();
+        response.put("success", false);
+        response.put("code", "VALIDATION_ERROR");
+        response.put("message", "参数校验失败");
+        response.put("errors", errors);
+        response.put("timestamp", LocalDateTime.now().toString());
+        response.put("traceId", RequestContextHolder.getTraceId());
+
+        return ResponseEntity.badRequest().body(response);
+    }
+
+    @ExceptionHandler(IllegalStateException.class)
+    public ResponseEntity<Map<String, Object>> handleIllegalStateException(
+            IllegalStateException ex) {
+        
+        logException(ex, HttpStatus.CONFLICT.value());
+
+        Map<String, Object> response = new HashMap<>();
+        response.put("success", false);
+        response.put("code", "STATE_ERROR");
+        response.put("message", ex.getMessage());
+        response.put("timestamp", LocalDateTime.now().toString());
+        response.put("traceId", RequestContextHolder.getTraceId());
+
+        return ResponseEntity.status(HttpStatus.CONFLICT).body(response);
+    }
+
+    @ExceptionHandler(Exception.class)
+    public ResponseEntity<Map<String, Object>> handleGlobalException(Exception ex) {
+        
+        logException(ex, HttpStatus.INTERNAL_SERVER_ERROR.value());
+
+        Map<String, Object> response = new HashMap<>();
+        response.put("success", false);
+        response.put("code", "INTERNAL_ERROR");
+        response.put("message", "系统内部错误，请联系管理员");
+        response.put("timestamp", LocalDateTime.now().toString());
+        response.put("traceId", RequestContextHolder.getTraceId());
+
+        return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(response);
+    }
+
+    private void logException(Exception ex, int statusCode) {
+        HyLogEvent logEvent = new HyLogEvent();
+        logEvent.setTraceId(RequestContextHolder.getTraceId());
+        logEvent.setTimestamp(LocalDateTime.now());
+        logEvent.setLevel(com.houyu.common.log.model.LogLevel.ERROR);
+        logEvent.setMessage("Global exception: " + ex.getClass().getSimpleName());
+        logEvent.setServiceName("hy-common-app");
+        logEvent.setMethodName("GlobalExceptionHandler");
+        logEvent.setExceptionClassName(ex.getClass().getName());
+        logEvent.setExceptionMessage(ex.getMessage());
+        logEvent.setSuccess(false);
+
+        logOutputManager.output(logEvent);
+    }
 }
 ```
 
@@ -1038,11 +1169,31 @@ public class JournalAspect {
         return result;
     }
 
-    @Around("execution(* com.houyu.*.service..*.remove*(..))")
+    @Around("execution(* com.houyu.*.service..*.removeById(..))")
+    public Object recordDeleteByIdJournal(ProceedingJoinPoint joinPoint) throws Throwable {
+        Object[] args = joinPoint.getArgs();
+        Object id = args[0];
+        
+        BaseEntity entity = findEntityBeforeDelete(joinPoint, id);
+        
+        Object result = joinPoint.proceed();
+        
+        if (entity != null) {
+            journalService.sendJournal(entity);
+        }
+        
+        return result;
+    }
+
+    @Around("execution(* com.houyu.*.service..*.remove(..))")
     public Object recordDeleteJournal(ProceedingJoinPoint joinPoint) throws Throwable {
         Object[] args = joinPoint.getArgs();
         
         BaseEntity entity = extractEntityFromArgs(args);
+        
+        if (entity == null) {
+            entity = findEntityBeforeDelete(joinPoint, args);
+        }
         
         Object result = joinPoint.proceed();
         
@@ -1058,6 +1209,37 @@ public class JournalAspect {
             if (arg instanceof BaseEntity) {
                 return (BaseEntity) arg;
             }
+        }
+        return null;
+    }
+
+    private BaseEntity findEntityBeforeDelete(ProceedingJoinPoint joinPoint, Object... args) {
+        try {
+            Object target = joinPoint.getTarget();
+            Class<?> targetClass = target.getClass();
+            
+            java.lang.reflect.Field mapperField = null;
+            for (java.lang.reflect.Field field : targetClass.getDeclaredFields()) {
+                if (field.getType().getName().contains("Mapper")) {
+                    mapperField = field;
+                    break;
+                }
+            }
+            
+            if (mapperField != null) {
+                mapperField.setAccessible(true);
+                Object mapper = mapperField.get(target);
+                
+                if (args.length > 0 && args[0] != null) {
+                    java.lang.reflect.Method selectByIdMethod = mapper.getClass().getMethod("selectById", Object.class);
+                    Object entity = selectByIdMethod.invoke(mapper, args[0]);
+                    if (entity instanceof BaseEntity) {
+                        return (BaseEntity) entity;
+                    }
+                }
+            }
+        } catch (Exception e) {
+            // Ignore, fallback to not recording
         }
         return null;
     }
@@ -1114,57 +1296,44 @@ public enum OpType {
 ```java
 package com.houyu.common.app.mybatis;
 
+import com.baomidou.mybatisplus.core.executor.MybatisPlusExecutor;
+import com.baomidou.mybatisplus.core.interceptor.InnerInterceptor;
 import com.houyu.common.app.entity.ShardEntity;
-import org.apache.ibatis.executor.statement.StatementHandler;
+import org.apache.ibatis.executor.Executor;
+import org.apache.ibatis.mapping.BoundSql;
 import org.apache.ibatis.mapping.MappedStatement;
-import org.apache.ibatis.plugin.*;
-import org.apache.ibatis.reflection.DefaultReflectorFactory;
-import org.apache.ibatis.reflection.MetaObject;
-import org.apache.ibatis.reflection.SystemMetaObject;
+import org.apache.ibatis.session.ResultHandler;
+import org.apache.ibatis.session.RowBounds;
 
-import java.sql.Connection;
-import java.util.Properties;
+import java.sql.SQLException;
 
-@Intercepts({@Signature(
-        type = StatementHandler.class,
-        method = "prepare",
-        args = {Connection.class, Integer.class})})
-public class TableShardInterceptor implements Interceptor {
+public class TableShardInterceptor implements InnerInterceptor {
 
     @Override
-    public Object intercept(Invocation invocation) throws Throwable {
-        StatementHandler statementHandler = (StatementHandler) invocation.getTarget();
-        MetaObject metaObject = MetaObject.forObject(
-                statementHandler,
-                SystemMetaObject.DEFAULT_OBJECT_FACTORY,
-                SystemMetaObject.DEFAULT_OBJECT_WRAPPER_FACTORY,
-                new DefaultReflectorFactory());
-
-        MappedStatement mappedStatement = 
-                (MappedStatement) metaObject.getValue("delegate.mappedStatement");
-        
-        String sql = (String) metaObject.getValue("delegate.boundSql.sql");
-        
-        Object parameterObject = metaObject.getValue("delegate.boundSql.parameterObject");
-        if (parameterObject instanceof ShardEntity shardEntity) {
+    public void beforeQuery(Executor executor, MappedStatement ms, Object parameter,
+                           RowBounds rowBounds, ResultHandler resultHandler, BoundSql boundSql) throws SQLException {
+        if (parameter instanceof ShardEntity shardEntity) {
             String tableNameSrc = shardEntity.getTableNameSrc();
             String tableNameDest = shardEntity.getTableNameDest();
             
             if (tableNameSrc != null && tableNameDest != null) {
-                sql = sql.replace(tableNameSrc, tableNameDest);
-                metaObject.setValue("delegate.boundSql.sql", sql);
+                String sql = boundSql.getSql();
+                String newSql = sql.replace(tableNameSrc, tableNameDest);
+                setBoundSql(boundSql, newSql);
             }
         }
-
-        return invocation.proceed();
     }
 
-    @Override
-    public Object plugin(Object target) {
-        return Plugin.wrap(target, this);
+    private void setBoundSql(BoundSql boundSql, String sql) {
+        try {
+            java.lang.reflect.Field sqlField = BoundSql.class.getDeclaredField("sql");
+            sqlField.setAccessible(true);
+            sqlField.set(boundSql, sql);
+        } catch (Exception e) {
+            throw new RuntimeException(e);
+        }
     }
-
-    @Override
+}
     public void setProperties(Properties properties) {
     }
 }
@@ -1175,38 +1344,39 @@ public class TableShardInterceptor implements Interceptor {
 ```java
 package com.houyu.common.app.mybatis;
 
+import com.baomidou.mybatisplus.core.interceptor.InnerInterceptor;
 import com.houyu.common.app.context.RequestContextHolder;
-import org.apache.ibatis.executor.statement.StatementHandler;
-import org.apache.ibatis.plugin.*;
+import org.apache.ibatis.executor.Executor;
+import org.apache.ibatis.mapping.BoundSql;
+import org.apache.ibatis.mapping.MappedStatement;
+import org.apache.ibatis.session.ResultHandler;
+import org.apache.ibatis.session.RowBounds;
 
-import java.sql.Connection;
-import java.util.Properties;
+import java.sql.SQLException;
 
-@Intercepts({@Signature(
-        type = StatementHandler.class,
-        method = "prepare",
-        args = {Connection.class, Integer.class})})
-public class DataPermissionInterceptor implements Interceptor {
+public class DataPermissionInterceptor implements InnerInterceptor {
 
     @Override
-    public Object intercept(Invocation invocation) throws Throwable {
-        StatementHandler statementHandler = (StatementHandler) invocation.getTarget();
-        
+    public void beforeQuery(Executor executor, MappedStatement ms, Object parameter,
+                           RowBounds rowBounds, ResultHandler resultHandler, BoundSql boundSql) throws SQLException {
         String dataScopeSql = RequestContextHolder.getDataScopeSql();
         if (dataScopeSql != null && !dataScopeSql.isEmpty()) {
-            String originalSql = statementHandler.getBoundSql().getSql();
+            String originalSql = boundSql.getSql();
             if (originalSql.toUpperCase().contains("SELECT")) {
                 String newSql = originalSql + " " + dataScopeSql;
-                com.houyu.common.app.util.SqlUtils.setSql(statementHandler, newSql);
+                setBoundSql(boundSql, newSql);
             }
         }
-
-        return invocation.proceed();
     }
 
-    @Override
-    public Object plugin(Object target) {
-        return Plugin.wrap(target, this);
+    private void setBoundSql(BoundSql boundSql, String sql) {
+        try {
+            java.lang.reflect.Field sqlField = BoundSql.class.getDeclaredField("sql");
+            sqlField.setAccessible(true);
+            sqlField.set(boundSql, sql);
+        } catch (Exception e) {
+            throw new RuntimeException(e);
+        }
     }
 
     @Override
@@ -1220,44 +1390,29 @@ public class DataPermissionInterceptor implements Interceptor {
 ```java
 package com.houyu.common.app.mybatis;
 
+import com.baomidou.mybatisplus.core.interceptor.InnerInterceptor;
 import com.baomidou.mybatisplus.core.metadata.IPage;
 import org.apache.ibatis.executor.Executor;
+import org.apache.ibatis.mapping.BoundSql;
 import org.apache.ibatis.mapping.MappedStatement;
-import org.apache.ibatis.plugin.*;
 import org.apache.ibatis.session.ResultHandler;
 import org.apache.ibatis.session.RowBounds;
 
-import java.util.Properties;
+import java.sql.SQLException;
 
-@Intercepts({@Signature(
-        type = Executor.class,
-        method = "query",
-        args = {MappedStatement.class, Object.class, RowBounds.class, ResultHandler.class})})
-public class PageInterceptor implements Interceptor {
+public class PageInterceptor implements InnerInterceptor {
 
     private static final int MAX_PAGE_SIZE = 5000;
 
     @Override
-    public Object intercept(Invocation invocation) throws Throwable {
-        Object parameter = invocation.getArgs()[1];
-        
+    public void beforeQuery(Executor executor, MappedStatement ms, Object parameter,
+                           RowBounds rowBounds, ResultHandler resultHandler, BoundSql boundSql) throws SQLException {
         if (parameter instanceof IPage<?> page) {
             long size = page.getSize();
             if (size > MAX_PAGE_SIZE) {
                 page.setSize(MAX_PAGE_SIZE);
             }
         }
-        
-        return invocation.proceed();
-    }
-
-    @Override
-    public Object plugin(Object target) {
-        return Plugin.wrap(target, this);
-    }
-
-    @Override
-    public void setProperties(Properties properties) {
     }
 }
 ```
@@ -1285,9 +1440,31 @@ public class PageInterceptor implements Interceptor {
 ```properties
 modulelist=com.p6spy.engine.spy.P6SpyModule,com.p6spy.engine.logging.P6LogFactory
 appender=com.p6spy.engine.spy.appender.Slf4JLogger
-logMessageFormat=com.p6spy.engine.spy.appender.CustomLineFormat
-customLogMessageFormat=%(currentTime) | %(executionTime)ms | %(category) | connection%(connectionId) | %(sqlSingleLine)
+logMessageFormat=com.houyu.common.app.util.TraceIdMessageFormattingStrategy
 dateformat=yyyy-MM-dd HH:mm:ss
+```
+
+**自定义 TraceIdMessageFormattingStrategy 实现**：
+
+```java
+package com.houyu.common.app.util;
+
+import com.houyu.common.app.context.RequestContextHolder;
+import com.p6spy.engine.spy.appender.MessageFormattingStrategy;
+
+public class TraceIdMessageFormattingStrategy implements MessageFormattingStrategy {
+
+    @Override
+    public String formatMessage(int connectionId, String now, long elapsed, 
+                                String category, String prepared, String sql) {
+        String traceId = RequestContextHolder.getTraceId();
+        if (traceId == null) {
+            traceId = "N/A";
+        }
+        return String.format("%s | %dms | %s | traceId=%s | connection%d | %s",
+                now, elapsed, category, traceId, connectionId, sql);
+    }
+}
 ```
 
 **数据源配置**：
