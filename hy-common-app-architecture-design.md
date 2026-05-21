@@ -39,10 +39,11 @@
 │                           请求入口层                                         │
 │  ┌──────────────────────────────────────────────────────────────────────┐   │
 │  │                    GlobalFilter / Interceptor                        │   │
-│  │  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐              │   │
-│  │  │ TraceFilter  │→│ ValidFilter  │→│ RequestFilter│              │   │
-│  │  │ 验证traceId  │  │ 参数校验     │  │ 请求预处理   │              │   │
-│  │  └──────────────┘  └──────────────┘  └──────────────┘              │   │
+│  │  ┌──────────────┐  ┌──────────────┐                              │   │
+│  │  │ TraceFilter  │→│ RequestFilter│                              │   │
+│  │  │ 验证traceId  │  │ 请求预处理   │                              │   │
+│  │  │ 无则返回403  │  │ 包装request  │                              │   │
+│  │  └──────────────┘  └──────────────┘                              │   │
 │  └────────────────────────────────┬───────────────────────────────────┘   │
 └───────────────────────────────────┼───────────────────────────────────────┘
                                     │
@@ -115,22 +116,21 @@
 
 | 层级 | 组件名称 | 职责说明 |
 | ---- | -------- | -------- |
-| 拦截器层 | TraceFilter | 验证请求头中的 traceId，不存在则生成 |
-| 拦截器层 | RequestFilter | 请求预处理，设置线程上下文 |
+| 拦截器层 | TraceFilter | 验证请求头中的 traceId，不存在则返回403 |
+| 拦截器层 | RequestFilter | 请求预处理，包装request支持多次读取body |
 | AOP层 | ControllerLogAspect | Controller 日志记录（warn/error级别） |
-| AOP层 | IdempotentAspect | 接口幂等处理 |
+| AOP层 | IdempotentAspect | 接口幂等处理（三态管理） |
 | AOP层 | AuthAspect | 权限验证（功能权限、数据权限） |
-| AOP层 | AuditAspect | 审计日志记录 |
+| AOP层 | AuditAspect | 审计日志记录（成功/失败均记录） |
 | AOP层 | ManagerLogAspect | Manager 日志记录（info/error级别） |
-| AOP层 | TransactionAspect | 事务管理 |
-| AOP层 | ServiceLogAspect | Service 日志记录（debug/error级别） |
-| AOP层 | EntityFillAspect | Entity 字段自动赋值 |
-| AOP层 | JournalAspect | 流水表记录 |
+| AOP层 | ServiceLogAspect | Service 日志记录（debug/error级别，含出参） |
+| AOP层 | EntityFillAspect | Entity 字段自动赋值（含wrapper方式） |
+| AOP层 | JournalAspect | 流水表记录（含删除操作） |
 | 拦截器层 | TableShardInterceptor | MyBatis 分表拦截器 |
 | 拦截器层 | DataPermissionInterceptor | 数据权限拦截器 |
-| 拦截器层 | PageInterceptor | 分页大小限制拦截器 |
-| 拦截器层 | SqlLogInterceptor | SQL 日志记录拦截器 |
-| 实体层 | BaseEntity | 公共实体基类 |
+| 拦截器层 | PageInterceptor | 分页大小限制拦截器（操作IPage对象） |
+| 集成组件 | p6spy | SQL日志记录（JDBC代理） |
+| 实体层 | BaseEntity | 公共实体基类（实现Serializable） |
 | 实体层 | ShardEntity | 分表实体基类 |
 | 上下文层 | RequestContextHolder | 线程上下文管理器 |
 
@@ -146,7 +146,8 @@ hy-common-app/
 │   │   │   └── com/houyu/common/app/
 │   │   │       ├── config/
 │   │   │       │   ├── AppAutoConfiguration.java
-│   │   │       │   └── AppProperties.java
+│   │   │       │   ├── AppProperties.java
+│   │   │       │   └── MyBatisPlusConfig.java
 │   │   │       ├── interceptor/
 │   │   │       │   ├── TraceFilter.java
 │   │   │       │   ├── RequestFilter.java
@@ -158,8 +159,7 @@ hy-common-app/
 │   │   │       │   │   ├── AuthAspect.java
 │   │   │       │   │   └── AuditAspect.java
 │   │   │       │   ├── manager/
-│   │   │       │   │   ├── ManagerLogAspect.java
-│   │   │       │   │   └── TransactionAspect.java
+│   │   │       │   │   └── ManagerLogAspect.java
 │   │   │       │   └── service/
 │   │   │       │       ├── ServiceLogAspect.java
 │   │   │       │       ├── EntityFillAspect.java
@@ -167,8 +167,7 @@ hy-common-app/
 │   │   │       ├── mybatis/
 │   │   │       │   ├── TableShardInterceptor.java
 │   │   │       │   ├── DataPermissionInterceptor.java
-│   │   │       │   ├── PageInterceptor.java
-│   │   │       │   └── SqlLogInterceptor.java
+│   │   │       │   └── PageInterceptor.java
 │   │   │       ├── entity/
 │   │   │       │   ├── BaseEntity.java
 │   │   │       │   └── ShardEntity.java
@@ -179,7 +178,8 @@ hy-common-app/
 │   │   │       │   ├── AuditLog.java
 │   │   │       │   └── Idempotent.java
 │   │   │       ├── enums/
-│   │   │       │   └── OpType.java
+│   │   │       │   ├── OpType.java
+│   │   │       │   └── IdempotentStatus.java
 │   │   │       ├── service/
 │   │   │       │   ├── IdempotentService.java
 │   │   │       │   ├── PermissionService.java
@@ -187,9 +187,10 @@ hy-common-app/
 │   │   │       └── util/
 │   │   │           └── SqlUtils.java
 │   │   └── resources/
-│   │       └── META-INF/
-│   │           └── spring/
-│   │               └── org.springframework.boot.autoconfigure.AutoConfiguration.imports
+│   │       ├── META-INF/
+│   │       │   └── spring/
+│   │       │       └── org.springframework.boot.autoconfigure.AutoConfiguration.imports
+│   │       └── spy.properties
 │   └── test/
 │       └── java/
 │           └── com/houyu/common/app/
@@ -204,24 +205,23 @@ hy-common-app/
 
 | 类名 | 职责 | 所属包 |
 | ---- | ---- | ------ |
-| TraceFilter | 验证/生成 traceId，存入线程上下文 | interceptor |
-| RequestFilter | 请求预处理，解析请求头信息 | interceptor |
-| ControllerLogAspect | 记录 Controller 层日志（warn/error） | aop.controller |
-| IdempotentAspect | 基于 requestId 实现接口幂等 | aop.controller |
+| TraceFilter | 验证 X-Trace-Id，不存在返回403 | interceptor |
+| RequestFilter | 请求预处理，包装ContentCachingRequestWrapper | interceptor |
+| ControllerLogAspect | 记录 Controller 层日志，含requestBody/responseHeaders | aop.controller |
+| IdempotentAspect | 幂等处理，三态管理（处理中/成功/失败） | aop.controller |
 | AuthAspect | 权限验证，支持注解和全局配置 | aop.controller |
-| AuditAspect | 审计日志记录 | aop.controller |
-| ManagerLogAspect | 记录 Manager 层日志（info/error） | aop.manager |
-| TransactionAspect | 声明式事务管理 | aop.manager |
-| ServiceLogAspect | 记录 Service 层日志（debug/error） | aop.service |
-| EntityFillAspect | 自动填充 entity 审计字段 | aop.service |
-| JournalAspect | 发送消息到流水表 | aop.service |
+| AuditAspect | 审计日志记录，成功(INFO)/失败(ERROR)均记录 | aop.controller |
+| ManagerLogAspect | 记录 Manager 层日志，含完整方法签名 | aop.manager |
+| ServiceLogAspect | 记录 Service 层日志，含出参 | aop.service |
+| EntityFillAspect | 自动填充 entity 审计字段（含wrapper方式） | aop.service |
+| JournalAspect | 发送消息到流水表（含删除操作） | aop.service |
 | TableShardInterceptor | MyBatis 分表拦截器 | mybatis |
 | DataPermissionInterceptor | 数据权限 SQL 改写 | mybatis |
-| PageInterceptor | 分页大小限制（最大5000） | mybatis |
-| SqlLogInterceptor | SQL 日志记录 | mybatis |
-| BaseEntity | 公共实体基类，包含审计字段 | entity |
+| PageInterceptor | 分页大小限制（操作IPage对象，最大5000） | mybatis |
+| BaseEntity | 公共实体基类，实现Serializable，含自动填充注解 | entity |
 | ShardEntity | 分表实体基类 | entity |
 | RequestContextHolder | 线程上下文管理器 | context |
+| IdempotentService | 幂等缓存管理，三态管理 | service |
 
 ## 4. 核心功能设计
 
@@ -233,9 +233,9 @@ hy-common-app/
 package com.houyu.common.app.interceptor;
 
 import com.houyu.common.app.context.RequestContextHolder;
-import com.houyu.common.log.trace.TraceIdGenerator;
 import jakarta.servlet.*;
 import jakarta.servlet.http.HttpServletRequest;
+import jakarta.servlet.http.HttpServletResponse;
 import org.springframework.core.Ordered;
 import org.springframework.core.annotation.Order;
 import org.springframework.stereotype.Component;
@@ -247,20 +247,18 @@ import java.io.IOException;
 public class TraceFilter implements Filter {
 
     private static final String TRACE_ID_HEADER = "X-Trace-Id";
-    private final TraceIdGenerator traceIdGenerator;
-
-    public TraceFilter(TraceIdGenerator traceIdGenerator) {
-        this.traceIdGenerator = traceIdGenerator;
-    }
 
     @Override
     public void doFilter(ServletRequest request, ServletResponse response, FilterChain chain)
             throws IOException, ServletException {
         HttpServletRequest httpRequest = (HttpServletRequest) request;
+        HttpServletResponse httpResponse = (HttpServletResponse) response;
         
         String traceId = httpRequest.getHeader(TRACE_ID_HEADER);
         if (traceId == null || traceId.isEmpty()) {
-            traceId = traceIdGenerator.generateTraceId();
+            httpResponse.setStatus(HttpServletResponse.SC_FORBIDDEN);
+            httpResponse.getWriter().write("X-Trace-Id is required");
+            return;
         }
         
         RequestContextHolder.setTraceId(traceId);
@@ -285,6 +283,7 @@ import jakarta.servlet.http.HttpServletRequest;
 import org.springframework.core.Ordered;
 import org.springframework.core.annotation.Order;
 import org.springframework.stereotype.Component;
+import org.springframework.web.util.ContentCachingRequestWrapper;
 
 import java.io.IOException;
 import java.util.HashMap;
@@ -303,7 +302,9 @@ public class RequestFilter implements Filter {
     public void doFilter(ServletRequest request, ServletResponse response, FilterChain chain)
             throws IOException, ServletException {
         HttpServletRequest httpRequest = (HttpServletRequest) request;
-
+        
+        ContentCachingRequestWrapper wrappedRequest = new ContentCachingRequestWrapper(httpRequest);
+        
         RequestContextHolder.setRequestId(httpRequest.getHeader(REQUEST_ID_HEADER));
         RequestContextHolder.setUserId(httpRequest.getHeader(USER_ID_HEADER));
         RequestContextHolder.setUserName(httpRequest.getHeader(USER_NAME_HEADER));
@@ -315,20 +316,31 @@ public class RequestFilter implements Filter {
             headers.put(name, httpRequest.getHeader(name));
         });
         RequestContextHolder.setRequestHeaders(headers);
-
-        try {
-            chain.doFilter(request, response);
-        } finally {
-            // 保留 traceId，供后续日志使用
-            String traceId = RequestContextHolder.getTraceId();
-            RequestContextHolder.clear();
-            RequestContextHolder.setTraceId(traceId);
-        }
+        
+        chain.doFilter(wrappedRequest, response);
     }
 }
 ```
 
 ### 4.2 Controller 层 AOP
+
+#### 4.2.0 技术选型评估
+
+| 方案 | 优点 | 缺点 | 适用场景 |
+| ---- | ---- | ---- | -------- |
+| **Filter** | 请求进入最早，性能好 | 无法获取方法参数和返回值，无法拦截特定注解 | 全局请求预处理 |
+| **Interceptor** | 可以获取请求上下文，支持拦截特定路径 | 无法获取方法参数校验结果 | 请求级别的拦截处理 |
+| **AOP Around** | 可以获取完整的方法签名、参数、返回值、异常 | 性能略低 | 日志记录、权限验证、事务管理 |
+| **@ControllerAdvice** | 统一异常处理，配合 @Validated 可获取校验结果 | 仅处理异常场景 | 全局异常处理、参数校验结果处理 |
+
+**最终选型**：**AOP Around + @ControllerAdvice 组合**
+
+- **AOP Around**：用于日志记录、幂等处理、权限验证、审计日志
+- **@ControllerAdvice**：用于全局异常处理，配合 `@Validated` 注解参数校验结果处理
+
+**选型理由**：
+1. AOP 可以完整获取方法执行的上下文（参数、返回值、异常），适合日志记录和业务逻辑增强
+2. @ControllerAdvice 可以统一处理 `@Validated` 参数校验失败的异常，与 AOP 配合使用可实现完整的参数校验结果处理
 
 #### 4.2.1 ControllerLogAspect 实现
 
@@ -365,16 +377,23 @@ public class ControllerLogAspect {
     @Around("execution(* com.houyu.*.controller..*.*(..))")
     public Object logController(ProceedingJoinPoint joinPoint) throws Throwable {
         long startTime = System.currentTimeMillis();
-        HttpServletRequest request = getRequest();
-        String traceId = RequestContextHolder.getTraceId();
-        String method = request.getMethod();
-        String url = request.getRequestURI();
-        String queryString = request.getQueryString();
+        ServletRequestAttributes attributes = (ServletRequestAttributes) RequestContextHolder.getRequestAttributes();
+        HttpServletRequest request = attributes != null ? attributes.getRequest() : null;
+        HttpServletResponse response = attributes != null ? attributes.getResponse() : null;
         
-        Map<String, String> headers = new HashMap<>();
-        request.getHeaderNames().asIterator().forEachRemaining(name -> {
-            headers.put(name, request.getHeader(name));
-        });
+        String traceId = RequestContextHolder.getTraceId();
+        String method = request != null ? request.getMethod() : "";
+        String url = request != null ? request.getRequestURI() : "";
+        String queryString = request != null ? request.getQueryString() : "";
+        
+        Map<String, String> requestHeaders = new HashMap<>();
+        if (request != null) {
+            request.getHeaderNames().asIterator().forEachRemaining(name -> {
+                requestHeaders.put(name, request.getHeader(name));
+            });
+        }
+
+        String requestBody = getRequestBody(request);
 
         Object result = null;
         Exception exception = null;
@@ -407,7 +426,8 @@ public class ControllerLogAspect {
             httpRequest.setMethod(method);
             httpRequest.setUri(url);
             httpRequest.setQueryString(queryString);
-            httpRequest.setHeaders(headers);
+            httpRequest.setHeaders(requestHeaders);
+            httpRequest.setRequestBody(requestBody);
             logEvent.setHttpRequest(httpRequest);
 
             if (exception != null) {
@@ -415,9 +435,20 @@ public class ControllerLogAspect {
                 logEvent.setExceptionMessage(exception.getMessage());
             }
 
-            if (result != null) {
+            if (result != null || response != null) {
                 HttpResponseInfo httpResponse = new HttpResponseInfo();
-                httpResponse.setResponseBody(result.toString());
+                if (result != null) {
+                    httpResponse.setResponseBody(result.toString());
+                }
+                
+                Map<String, String> responseHeaders = new HashMap<>();
+                if (response != null) {
+                    response.getHeaderNames().forEach(name -> {
+                        responseHeaders.put(name, response.getHeader(name));
+                    });
+                    httpResponse.setHeaders(responseHeaders);
+                    httpResponse.setStatusCode(response.getStatus());
+                }
                 logEvent.setHttpResponse(httpResponse);
             }
 
@@ -425,10 +456,22 @@ public class ControllerLogAspect {
         }
     }
 
-    private HttpServletRequest getRequest() {
-        ServletRequestAttributes attributes = 
-                (ServletRequestAttributes) RequestContextHolder.getRequestAttributes();
-        return attributes != null ? attributes.getRequest() : null;
+    private String getRequestBody(HttpServletRequest request) {
+        if (request == null) {
+            return null;
+        }
+        
+        String contentType = request.getContentType();
+        if (contentType != null && (contentType.contains("application/json") || 
+                contentType.contains("application/x-www-form-urlencoded"))) {
+            if (request instanceof ContentCachingRequestWrapper wrapper) {
+                byte[] body = wrapper.getContentAsByteArray();
+                if (body != null && body.length > 0) {
+                    return new String(body, java.nio.charset.StandardCharsets.UTF_8);
+                }
+            }
+        }
+        return null;
     }
 }
 ```
@@ -440,6 +483,7 @@ package com.houyu.common.app.aop.controller;
 
 import com.houyu.common.app.annotation.Idempotent;
 import com.houyu.common.app.context.RequestContextHolder;
+import com.houyu.common.app.enums.IdempotentStatus;
 import com.houyu.common.app.service.IdempotentService;
 import jakarta.servlet.http.HttpServletRequest;
 import org.aspectj.lang.ProceedingJoinPoint;
@@ -460,7 +504,7 @@ public class IdempotentAspect {
         this.idempotentService = idempotentService;
     }
 
-    @Around("@annotation(idempotent) || execution(* com.houyu.*.controller..*.*(..))")
+    @Around("@annotation(idempotent)")
     public Object handleIdempotent(ProceedingJoinPoint joinPoint, Idempotent idempotent) throws Throwable {
         HttpServletRequest request = getRequest();
         String requestId = request.getHeader(REQUEST_ID_HEADER);
@@ -471,19 +515,25 @@ public class IdempotentAspect {
         }
 
         String key = buildIdempotentKey(requestId, request.getMethod(), request.getRequestURI());
+        IdempotentStatus status = idempotentService.getStatus(key);
         
-        if (!retryFlag && idempotentService.exists(key)) {
+        if (status == IdempotentStatus.PROCESSING) {
+            throw new IllegalStateException("Request is processing");
+        }
+        
+        if (!retryFlag && status == IdempotentStatus.SUCCESS) {
             throw new IllegalStateException("Duplicate request detected");
         }
 
-        idempotentService.store(key);
+        idempotentService.store(key, IdempotentStatus.PROCESSING);
 
         try {
-            return joinPoint.proceed();
-        } finally {
-            if (!retryFlag) {
-                idempotentService.remove(key);
-            }
+            Object result = joinPoint.proceed();
+            idempotentService.store(key, IdempotentStatus.SUCCESS);
+            return result;
+        } catch (Exception e) {
+            idempotentService.store(key, IdempotentStatus.FAILED);
+            throw e;
         }
     }
 
@@ -507,6 +557,7 @@ package com.houyu.common.app.service;
 import com.alicp.jetcache.Cache;
 import com.alicp.jetcache.anno.CacheType;
 import com.alicp.jetcache.anno.CreateCache;
+import com.houyu.common.app.enums.IdempotentStatus;
 import org.springframework.stereotype.Service;
 
 import java.util.concurrent.TimeUnit;
@@ -518,19 +569,31 @@ public class IdempotentService {
                  cacheType = CacheType.REMOTE,
                  expire = 300,
                  timeUnit = TimeUnit.SECONDS)
-    private Cache<String, Boolean> idempotentCache;
+    private Cache<String, IdempotentStatus> idempotentCache;
 
-    public boolean exists(String key) {
-        return idempotentCache.get(key) != null;
+    public IdempotentStatus getStatus(String key) {
+        return idempotentCache.get(key);
     }
 
-    public void store(String key) {
-        idempotentCache.put(key, true);
+    public void store(String key, IdempotentStatus status) {
+        idempotentCache.put(key, status);
     }
 
     public void remove(String key) {
         idempotentCache.remove(key);
     }
+}
+```
+
+#### 4.2.4 IdempotentStatus 枚举
+
+```java
+package com.houyu.common.app.enums;
+
+public enum IdempotentStatus {
+    PROCESSING,
+    SUCCESS,
+    FAILED
 }
 ```
 
@@ -618,21 +681,37 @@ public class AuditAspect {
 
     @Around("@annotation(auditLog)")
     public Object audit(ProceedingJoinPoint joinPoint, AuditLog auditLog) throws Throwable {
-        Object result = joinPoint.proceed();
+        Exception exception = null;
+        boolean success = true;
         
-        HyLogEvent logEvent = new HyLogEvent();
-        logEvent.setTraceId(RequestContextHolder.getTraceId());
-        logEvent.setTimestamp(LocalDateTime.now());
-        logEvent.setLevel(com.houyu.common.log.model.LogLevel.INFO);
-        logEvent.setMessage("Audit log: " + auditLog.description());
-        logEvent.setServiceName("hy-common-app");
-        logEvent.setMethodName(joinPoint.getSignature().getName());
-        logEvent.setClassName(joinPoint.getTarget().getClass().getName());
-        logEvent.setUserId(RequestContextHolder.getUserId());
-        
-        logOutputManager.output(logEvent);
-        
-        return result;
+        try {
+            return joinPoint.proceed();
+        } catch (Exception e) {
+            exception = e;
+            success = false;
+            throw e;
+        } finally {
+            HyLogEvent logEvent = new HyLogEvent();
+            logEvent.setTraceId(RequestContextHolder.getTraceId());
+            logEvent.setTimestamp(LocalDateTime.now());
+            logEvent.setLevel(success ? 
+                    com.houyu.common.log.model.LogLevel.INFO : 
+                    com.houyu.common.log.model.LogLevel.ERROR);
+            logEvent.setMessage("Audit log: " + auditLog.description() + 
+                    (success ? " - success" : " - failed"));
+            logEvent.setServiceName("hy-common-app");
+            logEvent.setMethodName(joinPoint.getSignature().getName());
+            logEvent.setClassName(joinPoint.getTarget().getClass().getName());
+            logEvent.setUserId(RequestContextHolder.getUserId());
+            logEvent.setSuccess(success);
+            
+            if (!success && exception != null) {
+                logEvent.setExceptionClassName(exception.getClass().getName());
+                logEvent.setExceptionMessage(exception.getMessage());
+            }
+            
+            logOutputManager.output(logEvent);
+        }
     }
 }
 ```
@@ -685,7 +764,7 @@ public class ManagerLogAspect {
     public Object logManager(ProceedingJoinPoint joinPoint) throws Throwable {
         long startTime = System.currentTimeMillis();
         String traceId = RequestContextHolder.getTraceId();
-        String methodName = joinPoint.getSignature().getName();
+        String methodSignature = joinPoint.getSignature().toShortString();
         String className = joinPoint.getTarget().getClass().getName();
         Object[] args = joinPoint.getArgs();
 
@@ -713,7 +792,7 @@ public class ManagerLogAspect {
             logEvent.setSuccess(success);
             logEvent.setExecutionTime(executionTime);
             logEvent.setServiceName("hy-common-app");
-            logEvent.setMethodName(methodName);
+            logEvent.setMethodName(methodSignature);
             logEvent.setClassName(className);
             logEvent.setMdcContext(new java.util.HashMap<>(RequestContextHolder.getMdcContext()));
 
@@ -736,28 +815,7 @@ public class ManagerLogAspect {
 }
 ```
 
-#### 4.3.2 TransactionAspect 实现
-
-```java
-package com.houyu.common.app.aop.manager;
-
-import org.aspectj.lang.ProceedingJoinPoint;
-import org.aspectj.lang.annotation.Around;
-import org.aspectj.lang.annotation.Aspect;
-import org.springframework.stereotype.Component;
-import org.springframework.transaction.annotation.Transactional;
-
-@Aspect
-@Component
-public class TransactionAspect {
-
-    @Around("execution(* com.houyu.*.manager..*.*(..))")
-    @Transactional(rollbackFor = Exception.class)
-    public Object manageTransaction(ProceedingJoinPoint joinPoint) throws Throwable {
-        return joinPoint.proceed();
-    }
-}
-```
+> **说明**：Manager 层事务管理不再通过 TransactionAspect 统一处理，改为在具体写操作方法上显式标注 `@Transactional(rollbackFor = Exception.class)` 注解。
 
 ### 4.4 Service 层 AOP
 
@@ -826,6 +884,10 @@ public class ServiceLogAspect {
                 logEvent.setMessage("Args: " + Arrays.toString(args));
             }
 
+            if (result != null) {
+                logEvent.setMessage(logEvent.getMessage() + ", Result: " + result.toString());
+            }
+
             if (exception != null) {
                 logEvent.setExceptionClassName(exception.getClass().getName());
                 logEvent.setExceptionMessage(exception.getMessage());
@@ -842,6 +904,7 @@ public class ServiceLogAspect {
 ```java
 package com.houyu.common.app.aop.service;
 
+import com.baomidou.mybatisplus.core.conditions.Wrapper;
 import com.houyu.common.app.context.RequestContextHolder;
 import com.houyu.common.app.entity.BaseEntity;
 import com.houyu.common.app.enums.OpType;
@@ -851,6 +914,7 @@ import org.aspectj.lang.annotation.Before;
 import org.springframework.stereotype.Component;
 
 import java.time.LocalDateTime;
+import java.util.Collection;
 
 @Aspect
 @Component
@@ -871,25 +935,55 @@ public class EntityFillAspect {
         fillEntity(joinPoint, OpType.DELETE);
     }
 
+    @Before("execution(* com.houyu.*.service..*.saveOrUpdate*(..))")
+    public void fillForSaveOrUpdate(JoinPoint joinPoint) {
+        fillEntity(joinPoint, OpType.INSERT);
+    }
+
     private void fillEntity(JoinPoint joinPoint, OpType opType) {
         String traceId = RequestContextHolder.getTraceId();
         String userName = RequestContextHolder.getUserName();
 
         for (Object arg : joinPoint.getArgs()) {
             if (arg instanceof BaseEntity entity) {
-                entity.setTraceId(traceId);
-                entity.setOpType(opType.name());
-                entity.setOwner(userName);
-                
-                if (opType == OpType.INSERT) {
-                    entity.setCreater(userName);
-                    entity.setCreateTime(LocalDateTime.now());
+                fillBaseEntity(entity, traceId, userName, opType);
+            } else if (arg instanceof Collection<?> collection) {
+                collection.forEach(item -> {
+                    if (item instanceof BaseEntity entity) {
+                        fillBaseEntity(entity, traceId, userName, opType);
+                    }
+                });
+            } else if (arg instanceof Wrapper<?>) {
+                Object entity = extractEntityFromWrapper(arg);
+                if (entity instanceof BaseEntity baseEntity) {
+                    fillBaseEntity(baseEntity, traceId, userName, opType);
                 }
-                
-                entity.setUpdater(userName);
-                entity.setUpdateTime(LocalDateTime.now());
-                entity.setIsCurrent(true);
             }
+        }
+    }
+
+    private void fillBaseEntity(BaseEntity entity, String traceId, String userName, OpType opType) {
+        entity.setTraceId(traceId);
+        entity.setOpType(opType.name());
+        entity.setOwner(userName);
+        
+        if (opType == OpType.INSERT) {
+            entity.setCreater(userName);
+            entity.setCreateTime(LocalDateTime.now());
+        }
+        
+        entity.setUpdater(userName);
+        entity.setUpdateTime(LocalDateTime.now());
+        entity.setIsCurrent(true);
+    }
+
+    private Object extractEntityFromWrapper(Object wrapper) {
+        try {
+            java.lang.reflect.Field entityField = wrapper.getClass().getDeclaredField("entity");
+            entityField.setAccessible(true);
+            return entityField.get(wrapper);
+        } catch (Exception e) {
+            return null;
         }
     }
 }
@@ -918,10 +1012,8 @@ public class JournalAspect {
         this.journalService = journalService;
     }
 
-    @Around("execution(* com.houyu.*.service..*.save*(..)) || " +
-            "execution(* com.houyu.*.service..*.update*(..)) || " +
-            "execution(* com.houyu.*.service..*.remove*(..))")
-    public Object recordJournal(ProceedingJoinPoint joinPoint) throws Throwable {
+    @Around("execution(* com.houyu.*.service..*.save*(..))")
+    public Object recordSaveJournal(ProceedingJoinPoint joinPoint) throws Throwable {
         Object result = joinPoint.proceed();
         
         for (Object arg : joinPoint.getArgs()) {
@@ -931,6 +1023,43 @@ public class JournalAspect {
         }
         
         return result;
+    }
+
+    @Around("execution(* com.houyu.*.service..*.update*(..))")
+    public Object recordUpdateJournal(ProceedingJoinPoint joinPoint) throws Throwable {
+        Object result = joinPoint.proceed();
+        
+        for (Object arg : joinPoint.getArgs()) {
+            if (arg instanceof BaseEntity entity) {
+                journalService.sendJournal(entity);
+            }
+        }
+        
+        return result;
+    }
+
+    @Around("execution(* com.houyu.*.service..*.remove*(..))")
+    public Object recordDeleteJournal(ProceedingJoinPoint joinPoint) throws Throwable {
+        Object[] args = joinPoint.getArgs();
+        
+        BaseEntity entity = extractEntityFromArgs(args);
+        
+        Object result = joinPoint.proceed();
+        
+        if (entity != null) {
+            journalService.sendJournal(entity);
+        }
+        
+        return result;
+    }
+
+    private BaseEntity extractEntityFromArgs(Object[] args) {
+        for (Object arg : args) {
+            if (arg instanceof BaseEntity) {
+                return (BaseEntity) arg;
+            }
+        }
+        return null;
     }
 }
 ```
@@ -947,9 +1076,21 @@ import org.springframework.stereotype.Service;
 public class JournalService {
 
     public void sendJournal(BaseEntity entity) {
+        BaseEntity journalEntity = cloneEntity(entity);
+        journalEntity.setOpType(entity.getOpType());
+        journalEntity.setTraceId(entity.getTraceId());
+        
         // 发送消息到消息队列，异步写入流水表
         // 实际实现可使用 Kafka/RabbitMQ 等消息中间件
         System.out.println("Sending journal for entity: " + entity.getClass().getSimpleName());
+    }
+
+    private BaseEntity cloneEntity(BaseEntity entity) {
+        try {
+            return entity.getClass().getDeclaredConstructor().newInstance();
+        } catch (Exception e) {
+            return null;
+        }
     }
 }
 ```
@@ -1079,47 +1220,34 @@ public class DataPermissionInterceptor implements Interceptor {
 ```java
 package com.houyu.common.app.mybatis;
 
-import org.apache.ibatis.executor.statement.StatementHandler;
+import com.baomidou.mybatisplus.core.metadata.IPage;
+import org.apache.ibatis.executor.Executor;
+import org.apache.ibatis.mapping.MappedStatement;
 import org.apache.ibatis.plugin.*;
+import org.apache.ibatis.session.ResultHandler;
+import org.apache.ibatis.session.RowBounds;
 
-import java.sql.Connection;
 import java.util.Properties;
 
 @Intercepts({@Signature(
-        type = StatementHandler.class,
-        method = "prepare",
-        args = {Connection.class, Integer.class})})
+        type = Executor.class,
+        method = "query",
+        args = {MappedStatement.class, Object.class, RowBounds.class, ResultHandler.class})})
 public class PageInterceptor implements Interceptor {
 
     private static final int MAX_PAGE_SIZE = 5000;
 
     @Override
     public Object intercept(Invocation invocation) throws Throwable {
-        StatementHandler statementHandler = (StatementHandler) invocation.getTarget();
-        String sql = statementHandler.getBoundSql().getSql();
+        Object parameter = invocation.getArgs()[1];
         
-        String upperSql = sql.toUpperCase();
-        int limitIndex = upperSql.indexOf("LIMIT");
-        
-        if (limitIndex != -1) {
-            int afterLimit = limitIndex + 5;
-            int endIndex = upperSql.indexOf(" ", afterLimit);
-            if (endIndex == -1) {
-                endIndex = upperSql.length();
-            }
-            
-            try {
-                int limit = Integer.parseInt(upperSql.substring(afterLimit, endIndex).trim());
-                if (limit > MAX_PAGE_SIZE) {
-                    String newSql = sql.substring(0, limitIndex) + "LIMIT " + MAX_PAGE_SIZE + 
-                            sql.substring(limitIndex + 5 + String.valueOf(limit).length());
-                    com.houyu.common.app.util.SqlUtils.setSql(statementHandler, newSql);
-                }
-            } catch (NumberFormatException e) {
-                // Ignore
+        if (parameter instanceof IPage<?> page) {
+            long size = page.getSize();
+            if (size > MAX_PAGE_SIZE) {
+                page.setSize(MAX_PAGE_SIZE);
             }
         }
-
+        
         return invocation.proceed();
     }
 
@@ -1134,100 +1262,40 @@ public class PageInterceptor implements Interceptor {
 }
 ```
 
-#### 4.5.4 SqlLogInterceptor 实现
+> **说明**：PageInterceptor 与 PaginationInnerInterceptor 注册顺序说明：
+> 1. PageInterceptor 应在 PaginationInnerInterceptor 之前注册（order 值更小）
+> 2. PageInterceptor 负责截断 size 值，保证安全
+> 3. PaginationInnerInterceptor 负责生成分页 SQL
+> 4. 在 MyBatisPlusConfig 中配置时，PageInterceptor 的 addInterceptor 调用应早于 PaginationInnerInterceptor
 
-```java
-package com.houyu.common.app.mybatis;
+#### 4.5.4 SQL 日志记录 - p6spy 集成
 
-import com.houyu.common.app.context.RequestContextHolder;
-import com.houyu.common.log.model.HyLogEvent;
-import com.houyu.common.log.output.LogOutputManager;
-import org.apache.ibatis.executor.Executor;
-import org.apache.ibatis.mapping.BoundSql;
-import org.apache.ibatis.mapping.MappedStatement;
-import org.apache.ibatis.plugin.*;
-import org.apache.ibatis.session.ResultHandler;
-import org.apache.ibatis.session.RowBounds;
+> **说明**：不再使用 SqlLogInterceptor，改为集成 p6spy 实现 SQL 日志记录。p6spy 是一个 JDBC 代理，能够完整记录执行的 SQL 语句（已完成参数替换），比 MyBatis 拦截器方式更可靠。
 
-import java.time.LocalDateTime;
-import java.util.Properties;
+**pom.xml 依赖**：
+```xml
+<dependency>
+    <groupId>p6spy</groupId>
+    <artifactId>p6spy</artifactId>
+    <version>3.9.1</version>
+</dependency>
+```
 
-@Intercepts({@Signature(
-        type = Executor.class,
-        method = "query",
-        args = {MappedStatement.class, Object.class, RowBounds.class, ResultHandler.class}),
-        @Signature(
-        type = Executor.class,
-        method = "update",
-        args = {MappedStatement.class, Object.class})})
-public class SqlLogInterceptor implements Interceptor {
+**spy.properties 配置**：
+```properties
+modulelist=com.p6spy.engine.spy.P6SpyModule,com.p6spy.engine.logging.P6LogFactory
+appender=com.p6spy.engine.spy.appender.Slf4JLogger
+logMessageFormat=com.p6spy.engine.spy.appender.CustomLineFormat
+customLogMessageFormat=%(currentTime) | %(executionTime)ms | %(category) | connection%(connectionId) | %(sqlSingleLine)
+dateformat=yyyy-MM-dd HH:mm:ss
+```
 
-    private final LogOutputManager logOutputManager;
-
-    public SqlLogInterceptor(LogOutputManager logOutputManager) {
-        this.logOutputManager = logOutputManager;
-    }
-
-    @Override
-    public Object intercept(Invocation invocation) throws Throwable {
-        long startTime = System.currentTimeMillis();
-        
-        MappedStatement mappedStatement = (MappedStatement) invocation.getArgs()[0];
-        Object parameter = invocation.getArgs()[1];
-        BoundSql boundSql = mappedStatement.getBoundSql(parameter);
-        
-        String sql = boundSql.getSql();
-        Object[] parameters = boundSql.getParameterObject() != null ? 
-                new Object[]{boundSql.getParameterObject()} : null;
-
-        Object result = null;
-        Exception exception = null;
-        
-        try {
-            result = invocation.proceed();
-            return result;
-        } catch (Exception e) {
-            exception = e;
-            throw e;
-        } finally {
-            long executionTime = System.currentTimeMillis() - startTime;
-            
-            HyLogEvent logEvent = new HyLogEvent();
-            logEvent.setTraceId(RequestContextHolder.getTraceId());
-            logEvent.setTimestamp(LocalDateTime.now());
-            logEvent.setLevel(exception != null ? 
-                    com.houyu.common.log.model.LogLevel.ERROR : 
-                    com.houyu.common.log.model.LogLevel.DEBUG);
-            logEvent.setMessage("SQL Execution");
-            logEvent.setServiceName("hy-common-app");
-            logEvent.setMethodName(mappedStatement.getId());
-            logEvent.setExecutionTime(executionTime);
-            logEvent.setSuccess(exception == null);
-            
-            if (parameters != null) {
-                logEvent.setMessage("SQL: " + sql + ", Params: " + parameters.toString());
-            } else {
-                logEvent.setMessage("SQL: " + sql);
-            }
-
-            if (exception != null) {
-                logEvent.setExceptionClassName(exception.getClass().getName());
-                logEvent.setExceptionMessage(exception.getMessage());
-            }
-
-            logOutputManager.output(logEvent);
-        }
-    }
-
-    @Override
-    public Object plugin(Object target) {
-        return Plugin.wrap(target, this);
-    }
-
-    @Override
-    public void setProperties(Properties properties) {
-    }
-}
+**数据源配置**：
+```yaml
+spring:
+  datasource:
+    url: jdbc:p6spy:postgresql://localhost:5432/postgres
+    driver-class-name: com.p6spy.engine.spy.P6SpyDriver
 ```
 
 ### 4.6 公共 Entity
@@ -1237,46 +1305,63 @@ public class SqlLogInterceptor implements Interceptor {
 ```java
 package com.houyu.common.app.entity;
 
+import com.baomidou.mybatisplus.annotation.FieldFill;
+import com.baomidou.mybatisplus.annotation.IdType;
+import com.baomidou.mybatisplus.annotation.TableField;
+import com.baomidou.mybatisplus.annotation.TableId;
 import com.fasterxml.jackson.annotation.JsonFormat;
 import io.swagger.v3.oas.annotations.media.Schema;
 import lombok.Data;
 
+import java.io.Serializable;
 import java.time.LocalDateTime;
 
 @Data
 @Schema(description = "公共实体基类")
-public class BaseEntity {
+public class BaseEntity implements Serializable {
+
+    private static final long serialVersionUID = 1L;
 
     @Schema(description = "自增主键（内部排序，禁止插队）")
+    @TableId(value = "id", type = IdType.AUTO)
     private Long id;
 
     @Schema(description = "是否当前有效版本")
+    @TableField(value = "is_current")
     private Boolean isCurrent;
 
     @Schema(description = "日志链路追踪ID")
+    @TableField(value = "trace_id", fill = FieldFill.INSERT_UPDATE)
     private String traceId;
 
     @Schema(description = "数据拥有人")
+    @TableField(value = "owner", fill = FieldFill.INSERT_UPDATE)
     private String owner;
 
     @Schema(description = "创建人")
+    @TableField(value = "creater", fill = FieldFill.INSERT)
     private String creater;
 
     @Schema(description = "创建时间")
     @JsonFormat(pattern = "yyyy-MM-dd HH:mm:ss")
+    @TableField(value = "create_time", fill = FieldFill.INSERT)
     private LocalDateTime createTime;
 
     @Schema(description = "修改人")
+    @TableField(value = "updater", fill = FieldFill.INSERT_UPDATE)
     private String updater;
 
     @Schema(description = "修改时间")
     @JsonFormat(pattern = "yyyy-MM-dd HH:mm:ss")
+    @TableField(value = "update_time", fill = FieldFill.INSERT_UPDATE)
     private LocalDateTime updateTime;
 
     @Schema(description = "操作类型（insert,update,delete）")
+    @TableField(value = "op_type", fill = FieldFill.INSERT_UPDATE)
     private String opType;
 
     @Schema(description = "备注")
+    @TableField(value = "remark")
     private String remark;
 }
 ```
@@ -1485,6 +1570,13 @@ public class RequestContextHolder {
             <artifactId>hy-common-log</artifactId>
         </dependency>
 
+        <!-- p6spy for SQL logging -->
+        <dependency>
+            <groupId>p6spy</groupId>
+            <artifactId>p6spy</artifactId>
+            <version>3.9.1</version>
+        </dependency>
+
         <!-- Lombok -->
         <dependency>
             <groupId>org.projectlombok</groupId>
@@ -1570,6 +1662,59 @@ public class AppProperties {
     @Data
     public static class SecurityConfig {
         private boolean enabled = true;
+    }
+}
+```
+
+### 6.3 AutoConfiguration.imports 配置
+
+**文件路径**：`src/main/resources/META-INF/spring/org.springframework.boot.autoconfigure.AutoConfiguration.imports`
+
+```
+com.houyu.common.app.config.AppAutoConfiguration
+com.houyu.common.app.config.MyBatisPlusConfig
+com.houyu.common.app.interceptor.TraceFilter
+com.houyu.common.app.interceptor.RequestFilter
+com.houyu.common.app.aop.controller.ControllerLogAspect
+com.houyu.common.app.aop.controller.IdempotentAspect
+com.houyu.common.app.aop.controller.AuthAspect
+com.houyu.common.app.aop.controller.AuditAspect
+com.houyu.common.app.aop.manager.ManagerLogAspect
+com.houyu.common.app.aop.service.ServiceLogAspect
+com.houyu.common.app.aop.service.EntityFillAspect
+com.houyu.common.app.aop.service.JournalAspect
+com.houyu.common.app.mybatis.TableShardInterceptor
+com.houyu.common.app.mybatis.DataPermissionInterceptor
+com.houyu.common.app.mybatis.PageInterceptor
+```
+
+### 6.4 MyBatisPlusConfig 配置类
+
+```java
+package com.houyu.common.app.config;
+
+import com.baomidou.mybatisplus.annotation.DbType;
+import com.baomidou.mybatisplus.extension.plugins.MybatisPlusInterceptor;
+import com.baomidou.mybatisplus.extension.plugins.inner.PaginationInnerInterceptor;
+import com.houyu.common.app.mybatis.DataPermissionInterceptor;
+import com.houyu.common.app.mybatis.PageInterceptor;
+import com.houyu.common.app.mybatis.TableShardInterceptor;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+
+@Configuration
+public class MyBatisPlusConfig {
+
+    @Bean
+    public MybatisPlusInterceptor mybatisPlusInterceptor() {
+        MybatisPlusInterceptor interceptor = new MybatisPlusInterceptor();
+        
+        interceptor.addInnerInterceptor(new PageInterceptor());
+        interceptor.addInnerInterceptor(new PaginationInnerInterceptor(DbType.POSTGRE_SQL));
+        interceptor.addInnerInterceptor(new TableShardInterceptor());
+        interceptor.addInnerInterceptor(new DataPermissionInterceptor());
+        
+        return interceptor;
     }
 }
 ```
