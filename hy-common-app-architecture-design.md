@@ -568,12 +568,13 @@ package com.houyu.common.app.service;
 import com.alicp.jetcache.Cache;
 import com.alicp.jetcache.CacheManager;
 import com.alicp.jetcache.anno.CacheType;
+import com.alicp.jetcache.anno.CreateCache;
+import com.alicp.jetcache.embedded.EmbeddedCacheBuilder;
+import com.alicp.jetcache.support.QuickConfig;
 import com.houyu.common.app.config.AppProperties;
 import com.houyu.common.app.enums.IdempotentStatus;
 import jakarta.annotation.PostConstruct;
 import org.springframework.stereotype.Service;
-
-import java.util.concurrent.TimeUnit;
 
 @Service
 public class IdempotentService {
@@ -594,22 +595,20 @@ public class IdempotentService {
         int processingExpire = appProperties.getIdempotent().getProcessingExpireSeconds();
         int successExpire = appProperties.getIdempotent().getSuccessExpireSeconds();
 
-        processingCache = cacheManager.createCache(
-                "app:idempotent:processing:",
-                CacheType.REMOTE,
-                String.class,
-                IdempotentStatus.class,
-                processingExpire,
-                TimeUnit.SECONDS
+        processingCache = cacheManager.getOrCreateCache(
+                QuickConfig.newBuilder("app:idempotent:processing")
+                        .cacheType(CacheType.REMOTE)
+                        .expire(processingExpire)
+                        .keyConvertor("fastjson2")
+                        .build()
         );
 
-        successCache = cacheManager.createCache(
-                "app:idempotent:success:",
-                CacheType.REMOTE,
-                String.class,
-                IdempotentStatus.class,
-                successExpire,
-                TimeUnit.SECONDS
+        successCache = cacheManager.getOrCreateCache(
+                QuickConfig.newBuilder("app:idempotent:success")
+                        .cacheType(CacheType.REMOTE)
+                        .expire(successExpire)
+                        .keyConvertor("fastjson2")
+                        .build()
         );
     }
 
@@ -1153,6 +1152,7 @@ package com.houyu.common.app.aop.service;
 
 import com.houyu.common.app.context.RequestContextHolder;
 import com.houyu.common.app.entity.BaseEntity;
+import com.houyu.common.app.enums.OpType;
 import com.houyu.common.app.service.JournalService;
 import org.aspectj.lang.ProceedingJoinPoint;
 import org.aspectj.lang.annotation.Around;
@@ -1366,6 +1366,7 @@ import org.apache.ibatis.session.ResultHandler;
 import org.apache.ibatis.session.RowBounds;
 
 import java.sql.SQLException;
+import java.util.Properties;
 
 public class DataPermissionInterceptor implements InnerInterceptor {
 
