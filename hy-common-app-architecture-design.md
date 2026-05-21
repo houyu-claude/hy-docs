@@ -191,7 +191,8 @@ hy-common-app/
 │   │   │       │   ├── PermissionService.java
 │   │   │       │   └── JournalService.java
 │   │   │       └── util/
-│   │   │           └── SqlUtils.java
+│   │   │           ├── SqlUtils.java
+│   │   │           └── TraceIdMessageFormattingStrategy.java
 │   │   └── resources/
 │   │       ├── META-INF/
 │   │       │   └── spring/
@@ -565,9 +566,11 @@ public class IdempotentAspect {
 package com.houyu.common.app.service;
 
 import com.alicp.jetcache.Cache;
+import com.alicp.jetcache.CacheManager;
 import com.alicp.jetcache.anno.CacheType;
-import com.alicp.jetcache.anno.CreateCache;
+import com.houyu.common.app.config.AppProperties;
 import com.houyu.common.app.enums.IdempotentStatus;
+import jakarta.annotation.PostConstruct;
 import org.springframework.stereotype.Service;
 
 import java.util.concurrent.TimeUnit;
@@ -575,17 +578,40 @@ import java.util.concurrent.TimeUnit;
 @Service
 public class IdempotentService {
 
-    @CreateCache(name = "app:idempotent:processing:",
-                 cacheType = CacheType.REMOTE,
-                 expire = 30,
-                 timeUnit = TimeUnit.SECONDS)
     private Cache<String, IdempotentStatus> processingCache;
-
-    @CreateCache(name = "app:idempotent:success:",
-                 cacheType = CacheType.REMOTE,
-                 expire = 300,
-                 timeUnit = TimeUnit.SECONDS)
     private Cache<String, IdempotentStatus> successCache;
+
+    private final CacheManager cacheManager;
+    private final AppProperties appProperties;
+
+    public IdempotentService(CacheManager cacheManager, AppProperties appProperties) {
+        this.cacheManager = cacheManager;
+        this.appProperties = appProperties;
+    }
+
+    @PostConstruct
+    public void init() {
+        int processingExpire = appProperties.getIdempotent().getProcessingExpireSeconds();
+        int successExpire = appProperties.getIdempotent().getSuccessExpireSeconds();
+
+        processingCache = cacheManager.createCache(
+                "app:idempotent:processing:",
+                CacheType.REMOTE,
+                String.class,
+                IdempotentStatus.class,
+                processingExpire,
+                TimeUnit.SECONDS
+        );
+
+        successCache = cacheManager.createCache(
+                "app:idempotent:success:",
+                CacheType.REMOTE,
+                String.class,
+                IdempotentStatus.class,
+                successExpire,
+                TimeUnit.SECONDS
+        );
+    }
 
     public IdempotentStatus getStatus(String key) {
         IdempotentStatus processing = processingCache.get(key);
@@ -1179,6 +1205,7 @@ public class JournalAspect {
         Object result = joinPoint.proceed();
         
         if (entity != null) {
+            entity.setOpType(OpType.DELETE.name());
             journalService.sendJournal(entity);
         }
         
@@ -1198,6 +1225,7 @@ public class JournalAspect {
         Object result = joinPoint.proceed();
         
         if (entity != null) {
+            entity.setOpType(OpType.DELETE.name());
             journalService.sendJournal(entity);
         }
         
@@ -1258,21 +1286,9 @@ import org.springframework.stereotype.Service;
 public class JournalService {
 
     public void sendJournal(BaseEntity entity) {
-        BaseEntity journalEntity = cloneEntity(entity);
-        journalEntity.setOpType(entity.getOpType());
-        journalEntity.setTraceId(entity.getTraceId());
-        
         // 发送消息到消息队列，异步写入流水表
         // 实际实现可使用 Kafka/RabbitMQ 等消息中间件
         System.out.println("Sending journal for entity: " + entity.getClass().getSimpleName());
-    }
-
-    private BaseEntity cloneEntity(BaseEntity entity) {
-        try {
-            return entity.getClass().getDeclaredConstructor().newInstance();
-        } catch (Exception e) {
-            return null;
-        }
     }
 }
 ```
@@ -1332,9 +1348,6 @@ public class TableShardInterceptor implements InnerInterceptor {
         } catch (Exception e) {
             throw new RuntimeException(e);
         }
-    }
-}
-    public void setProperties(Properties properties) {
     }
 }
 ```
@@ -1456,7 +1469,7 @@ public class TraceIdMessageFormattingStrategy implements MessageFormattingStrate
 
     @Override
     public String formatMessage(int connectionId, String now, long elapsed, 
-                                String category, String prepared, String sql) {
+                                String category, String prepared, String sql, String url) {
         String traceId = RequestContextHolder.getTraceId();
         if (traceId == null) {
             traceId = "N/A";
@@ -1774,7 +1787,8 @@ hy:
   app:
     enabled: true
     idempotent:
-      expire-seconds: 300
+      processing-expire-seconds: 30
+      success-expire-seconds: 300
     page:
       max-size: 5000
     security:
@@ -1828,7 +1842,8 @@ public class AppProperties {
 
     @Data
     public static class IdempotentConfig {
-        private int expireSeconds = 300;
+        private int processingExpireSeconds = 30;
+        private int successExpireSeconds = 300;
     }
 
     @Data
@@ -1856,13 +1871,11 @@ com.houyu.common.app.aop.controller.ControllerLogAspect
 com.houyu.common.app.aop.controller.IdempotentAspect
 com.houyu.common.app.aop.controller.AuthAspect
 com.houyu.common.app.aop.controller.AuditAspect
+com.houyu.common.app.aop.controller.GlobalExceptionHandler
 com.houyu.common.app.aop.manager.ManagerLogAspect
 com.houyu.common.app.aop.service.ServiceLogAspect
 com.houyu.common.app.aop.service.EntityFillAspect
 com.houyu.common.app.aop.service.JournalAspect
-com.houyu.common.app.mybatis.TableShardInterceptor
-com.houyu.common.app.mybatis.DataPermissionInterceptor
-com.houyu.common.app.mybatis.PageInterceptor
 ```
 
 ### 6.4 MyBatisPlusConfig 配置类
